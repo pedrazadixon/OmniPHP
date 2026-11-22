@@ -1,0 +1,40 @@
+# Rust build output
+target/
+**/*.rs.bk
+*.pdb
+
+# Built installers
+/dist/
+
+# Downloaded runtimes and tools (Apache, PHP, MySQL, Mailpit, cloudflared, ...)
+/bin/
+
+# Runtime data (databases, mail store, sessions, temp files)
+/data/
+/tmp/
+/logs/
+*.log
+
+# User sites
+/www/*
+!/www/.gitkeep
+
+# Generated config (httpd.conf, vhosts, per-site php.ini, settings)
+/etc/
+
+# Certificates and private keys
+*.key
+*.pem
+*.crt
+*.csr
+*.pfx
+
+# Local environment and editor files
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+.claude/settings.local.json
+Thumbs.db
+Desktop.ini

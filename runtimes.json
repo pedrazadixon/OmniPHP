@@ -1,0 +1,160 @@
+{
+  "about": [
+    "The third-party programs OmniPHP runs, pinned to exact versions.",
+    "fetch-runtimes.bat downloads each one, checks its SHA-256 and unpacks it into bin\\.",
+    "Fields: 'dir' is where it lands, 'check' a file inside 'dir' that proves it is installed,",
+    "'urls' are tried in order (old releases move to an archive address), 'strip' is the single",
+    "folder inside the archive whose contents are wanted, 'exclude' lists files to leave out",
+    "('*' matches anything, including '/'), 'file' saves the download as it is, 'write' adds",
+    "small text files, 'optional' entries are skipped unless asked for."
+  ],
+  "runtimes": [
+    {
+      "name": "apache",
+      "version": "2.4.71 (Apache Lounge, VS18, build 261112)",
+      "dir": "bin/apache/httpd-2.4.71-261112-Win64-VS18",
+      "check": "bin/httpd.exe",
+      "strip": "Apache24",
+      "sha256": "44961a929dff16b767b3adbcea55760a942a00239b2891dc55806be34029e1fc",
+      "urls": [
+        "https://www.apachelounge.com/download/VS18/binaries/httpd-2.4.71-261112-Win64-VS18.zip"
+      ]
+    },
+    {
+      "name": "mod_fcgid",
+      "version": "2.3.10 (Apache Lounge, VS18; must match the Apache build)",
+      "dir": "bin/mod_fcgid",
+      "check": "mod_fcgid.so",
+      "sha256": "a92808ef3069366c8fcc939f5449f119ed4f0e37eda5575d1fe265e6937ab88a",
+      "urls": [
+        "https://www.apachelounge.com/download/VS18/modules/mod_fcgid-2.3.10-win64-VS18.zip"
+      ]
+    },
+    {
+      "name": "php-8.6",
+      "version": "8.6.0 (non-thread-safe, VS18)",
+      "dir": "bin/php/php-8.6.0-nts-Win32-vs18-x64",
+      "check": "php-cgi.exe",
+      "sha256": "d4783fffe1f4ab072600daff1622a7a2df936957a787a338c59e3dbd4d846d98",
+      "urls": [
+        "https://windows.php.net/downloads/releases/php-8.6.0-nts-Win32-vs18-x64.zip",
+        "https://windows.php.net/downloads/releases/archives/php-8.6.0-nts-Win32-vs18-x64.zip"
+      ]
+    },
+    {
+      "name": "php-8.4",
+      "version": "8.4.28 (non-thread-safe, VS17)",
+      "dir": "bin/php/php-8.4.28-nts-Win32-vs17-x64",
+      "check": "php-cgi.exe",
+      "sha256": "c1f9280588b7b6ad7b518969022f0b0175f106fab9d0639ad0e4ce7cd47ac1ed",
+      "urls": [
+        "https://windows.php.net/downloads/releases/php-8.4.28-nts-Win32-vs17-x64.zip",
+        "https://windows.php.net/downloads/releases/archives/php-8.4.28-nts-Win32-vs17-x64.zip"
+      ]
+    },
+    {
+      "name": "php-7.4",
+      "version": "7.4.33 (thread-safe, VC15)",
+      "dir": "bin/php/php-7.4.33-Win32-vc15-x64",
+      "check": "php-cgi.exe",
+      "sha256": "cdbb85b45f38f282f05764ca08648b5f92db99c75b2fb3848eb4a559f6553b48",
+      "urls": [
+        "https://windows.php.net/downloads/releases/archives/php-7.4.33-Win32-vc15-x64.zip",
+        "https://windows.php.net/downloads/releases/php-7.4.33-Win32-vc15-x64.zip"
+      ]
+    },
+    {
+      "name": "mysql",
+      "version": "8.4.3",
+      "dir": "bin/mysql/mysql-8.4.3-winx64",
+      "check": "bin/mysqld.exe",
+      "strip": "mysql-8.4.3-winx64",
+      "exclude": ["lib/*", "*.pdb"],
+      "sha256": "e401d0420486d91bd14eda7b6b449498007863ca340991e529adff4787352e7e",
+      "urls": [
+        "https://cdn.mysql.com/archives/mysql-8.4/mysql-8.4.3-winx64.zip",
+        "https://cdn.mysql.com/Downloads/MySQL-8.4/mysql-8.4.3-winx64.zip"
+      ]
+    },
+    {
+      "name": "mailpit",
+      "version": "1.22.3",
+      "dir": "bin/mailpit/1.22.3",
+      "check": "mailpit.exe",
+      "sha256": "93eba6c05d6cf996c77554e4b823c023c7a8925448baaa77bbc59ee4dbd2d08f",
+      "urls": [
+        "https://github.com/axllent/mailpit/releases/download/v1.22.3/mailpit-windows-amd64.zip"
+      ]
+    },
+    {
+      "name": "redis",
+      "version": "5.0.14.1 (tporadowski's Windows build)",
+      "dir": "bin/redis/redis-x64-5.0.14.1",
+      "check": "redis-server.exe",
+      "exclude": ["*.pdb"],
+      "sha256": "018ea18a35876383cbb5f4cd0258adfc87747cf9d619bce1cf73a2e36f720ccf",
+      "urls": [
+        "https://github.com/tporadowski/redis/releases/download/v5.0.14.1/Redis-x64-5.0.14.1.zip"
+      ]
+    },
+    {
+      "name": "cloudflared",
+      "version": "2026.11.1",
+      "dir": "bin/cloudflared",
+      "check": "cloudflared-windows-amd64.exe",
+      "file": "cloudflared-windows-amd64.exe",
+      "sha256": "341deda3db5ec498a0482254d6c38c0b7cf01a30c37bb5dd95d2216d08955e35",
+      "urls": [
+        "https://github.com/cloudflare/cloudflared/releases/download/2026.11.1/cloudflared-windows-amd64.exe"
+      ]
+    },
+    {
+      "name": "composer",
+      "version": "2.10.3",
+      "dir": "bin/composer",
+      "check": "composer.phar",
+      "file": "composer.phar",
+      "sha256": "7a2d379d5b8ffdaa028580ef26494c36d2feef4b178d3dd1473a4dbc5e17c8d6",
+      "urls": [
+        "https://getcomposer.org/download/2.10.3/composer.phar"
+      ],
+      "write": {
+        "composer.bat": "@ECHO OFF\r\nphp \"%~dp0composer.phar\" %*"
+      }
+    },
+    {
+      "name": "adminer",
+      "version": "6.3.1",
+      "dir": "bin/adminer",
+      "check": "adminer.php",
+      "file": "adminer.php",
+      "sha256": "a9aed04e4e68c4e46283804a69ee70cad4fbf23203b46470b760868b2fd9bd76",
+      "urls": [
+        "https://github.com/vrana/adminer/releases/download/v6.3.1/adminer-6.3.1.php",
+        "https://www.adminer.org/static/download/6.3.1/adminer-6.3.1.php"
+      ]
+    },
+    {
+      "name": "notepad++",
+      "version": "8.9.8.1 (portable, x64)",
+      "dir": "bin/notepad++",
+      "check": "notepad++.exe",
+      "sha256": "beddf5548e75c97930d1575ba1c7d113e6e2b33d0a200310e734ca08e225f414",
+      "urls": [
+        "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.9.8.1/npp.8.9.8.1.portable.x64.zip"
+      ]
+    },
+    {
+      "name": "git",
+      "version": "2.47.1 (PortableGit, 64-bit)",
+      "optional": true,
+      "dir": "bin/git",
+      "check": "cmd/git.exe",
+      "self_extracting": true,
+      "sha256": "4f3f21f4effcb659566883ee1ed3ae403e5b3d7a0699cee455f6cd765e1ac39c",
+      "urls": [
+        "https://github.com/git-for-windows/git/releases/download/v2.47.1.windows.1/PortableGit-2.47.1-64-bit.7z.exe"
+      ]
+    }
+  ]
+}
