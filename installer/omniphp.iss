@@ -10,9 +10,16 @@
 ;                        ISCC.exe /DBundleRuntimes=0 installer\omniphp.iss
 
 #define AppName "OmniPHP"
-#define AppVersion "0.1.0"
+#define AppVersion "1.0.0-beta.1"
 #ifndef BundleRuntimes
   #define BundleRuntimes "1"
+#endif
+; Where the runtimes are taken from. A release is built from a clean download
+; of runtimes.json rather than a bin\ that has been worked in:
+;   fetch-runtimes.bat -Root C:\clean
+;   ISCC.exe /DBinDir=C:\clean\bin installer\omniphp.iss
+#ifndef BinDir
+  #define BinDir "..\bin"
 #endif
 
 [Setup]
@@ -54,20 +61,20 @@ Name: "{app}\data"
 Source: "..\omniphp\target\release\omniphp.exe"; DestDir: "{app}"; DestName: "OmniPHP.exe"; Flags: ignoreversion
 ; Apache's FastCGI module is shipped even without the runtimes: it is small,
 ; and no site can run PHP without it.
-Source: "..\bin\mod_fcgid\*"; DestDir: "{app}\bin\mod_fcgid"; Flags: recursesubdirs createallsubdirs ignoreversion
+Source: "{#BinDir}\mod_fcgid\*"; DestDir: "{app}\bin\mod_fcgid"; Flags: recursesubdirs createallsubdirs ignoreversion
 #if BundleRuntimes == "1"
-Source: "..\bin\apache\*"; DestDir: "{app}\bin\apache"; Excludes: "logs\*"; Flags: recursesubdirs createallsubdirs ignoreversion
+Source: "{#BinDir}\apache\*"; DestDir: "{app}\bin\apache"; Excludes: "logs\*"; Flags: recursesubdirs createallsubdirs ignoreversion
 ; A php.ini left in a PHP folder is not OmniPHP's (it writes one per site)
 ; and may point at another machine's paths, so it is not shipped.
-Source: "..\bin\php\*"; DestDir: "{app}\bin\php"; Excludes: "php.ini"; Flags: recursesubdirs createallsubdirs ignoreversion
-Source: "..\bin\mysql\*"; DestDir: "{app}\bin\mysql"; Excludes: "my.ini"; Flags: recursesubdirs createallsubdirs ignoreversion
-Source: "..\bin\mailpit\*"; DestDir: "{app}\bin\mailpit"; Excludes: "*.log,*.db"; Flags: recursesubdirs createallsubdirs ignoreversion
-Source: "..\bin\redis\*"; DestDir: "{app}\bin\redis"; Excludes: "*.log,*.rdb"; Flags: recursesubdirs createallsubdirs ignoreversion
-Source: "..\bin\cloudflared\cloudflared-windows-amd64.exe"; DestDir: "{app}\bin\cloudflared"; Flags: ignoreversion
-Source: "..\bin\composer\*"; DestDir: "{app}\bin\composer"; Flags: recursesubdirs createallsubdirs ignoreversion
-Source: "..\bin\adminer\*"; DestDir: "{app}\bin\adminer"; Flags: recursesubdirs createallsubdirs ignoreversion
+Source: "{#BinDir}\php\*"; DestDir: "{app}\bin\php"; Excludes: "php.ini"; Flags: recursesubdirs createallsubdirs ignoreversion
+Source: "{#BinDir}\mysql\*"; DestDir: "{app}\bin\mysql"; Excludes: "my.ini"; Flags: recursesubdirs createallsubdirs ignoreversion
+Source: "{#BinDir}\mailpit\*"; DestDir: "{app}\bin\mailpit"; Excludes: "*.log,*.db"; Flags: recursesubdirs createallsubdirs ignoreversion
+Source: "{#BinDir}\redis\*"; DestDir: "{app}\bin\redis"; Excludes: "*.log,*.rdb"; Flags: recursesubdirs createallsubdirs ignoreversion
+Source: "{#BinDir}\cloudflared\cloudflared-windows-amd64.exe"; DestDir: "{app}\bin\cloudflared"; Flags: ignoreversion
+Source: "{#BinDir}\composer\*"; DestDir: "{app}\bin\composer"; Flags: recursesubdirs createallsubdirs ignoreversion
+Source: "{#BinDir}\adminer\*"; DestDir: "{app}\bin\adminer"; Flags: recursesubdirs createallsubdirs ignoreversion
 ; The editor behind the Hosts button. Its own settings and session are left out.
-Source: "..\bin\notepad++\*"; DestDir: "{app}\bin\notepad++"; Excludes: "config.xml,session.xml,\backup\*"; Flags: recursesubdirs createallsubdirs ignoreversion
+Source: "{#BinDir}\notepad++\*"; DestDir: "{app}\bin\notepad++"; Excludes: "config.xml,session.xml,\backup\*"; Flags: recursesubdirs createallsubdirs ignoreversion
 #endif
 
 [Icons]
