@@ -29,10 +29,12 @@ fn main() {
         Ok(paths) => paths,
         Err(error) => return fatal(error),
     };
-    let instance = single_instance::key_for(paths.root());
+    let instance = paths.install_key();
     if !single_instance::acquire(&instance) {
         return;
     }
+    crate::core::applog::init(&paths);
+    log_panics();
 
     let engine: SharedEngine = match Engine::load(paths) {
         Ok(engine) => Arc::new(Mutex::new(engine)),
@@ -80,7 +82,27 @@ fn main() {
             Ok(commands) => single_instance::listen(&instance, move || {
                 let _ = commands.try_send(TrayCommand::Open);
             }),
-            Err(error) => eprintln!("tray icon unavailable: {error:#}"),
+            Err(error) => {
+                eprintln!("tray icon unavailable: {error:#}");
+                crate::core::applog::write(&format!("tray icon unavailable: {error:#}"));
+            }
         }
     });
+}
+
+/// Records every panic in `logs\omniphp.log`; a release build has no console
+/// to show it on. A panic in a background action is survivable (the next
+/// action carries on), but one on the main thread ends the app, so that one
+/// also gets a dialog rather than a window that just vanishes.
+fn log_panics() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        crate::core::applog::write(&format!("panic: {info}"));
+        default_hook(info);
+        if std::thread::current().name() == Some("main") {
+            ui::window::fatal(
+                "OmniPHP stopped because of an unexpected error.\n\nThe details are in logs\\omniphp.log.",
+            );
+        }
+    }));
 }

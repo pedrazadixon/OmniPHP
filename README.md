@@ -355,6 +355,7 @@ The same executable works without the window, which is useful for scripts:
 omniphp apply                          write all configuration and validate it
 omniphp serve                          apply, start the services, stop them on Enter
 omniphp setup                          trust the CA and register addresses (administrator prompt)
+omniphp cleanup                        undo setup and remove the startup entry
 omniphp new <template> <name> [--no-db]
                                        create a site: blank, wordpress, laravel,
                                        codeigniter, symfony or prestashop
@@ -369,8 +370,9 @@ created  https://blog.test  in C:\OmniPHP\www\blog
 database blog (user root, no password, port 3306)
 ```
 
-The release build is a windowed app with no console, so it prints nothing; use a debug build
-when you want to read the output.
+The release build is a windowed app, so the prompt does not wait for it: the output appears in
+the prompt it was started from, but after the prompt has come back. Start it with
+`start /wait omniphp apply`, or pipe it (`omniphp apply | more`), to keep the two in order.
 
 ## For developers
 
@@ -498,11 +500,13 @@ For a new version, change the number in two places: `version` in `omniphp\Cargo.
   site: PHP's own `php.ini-development`, then OmniPHP's block, then the site's overrides last
   so they win. OmniPHP manages no PHP processes itself.
 - **Every change is validated.** Any change to sites or settings regenerates the configuration
-  and checks it with `httpd -t` before Apache reloads. A configuration Apache rejects is never
-  loaded, and a site change that cannot work is undone with the reason shown.
+  into a staging folder and checks it there with `httpd -t`. Only a configuration Apache
+  accepts replaces the one in use; a rejected one is never loaded, and a site change that
+  cannot work is undone with the reason shown.
 - **No administrator rights** in normal use. The only two privileged operations, trusting the
   certificate authority and writing the hosts file, happen in a short-lived helper behind one
-  Windows prompt, and only when you click **Set up**.
+  Windows prompt, and only when you click **Set up**. **Undo changes to Windows** in Settings
+  (or `omniphp cleanup`) reverses both, and the uninstaller does the same.
 - **Services are child processes** in a Windows job object, so nothing is left running if the
   app is killed. No Windows services are installed.
 - **The code** is split into `src\core\` (all logic and all tests, no UI code), `src\ui\` (the

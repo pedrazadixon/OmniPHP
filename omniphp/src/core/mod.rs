@@ -3,6 +3,7 @@
 //! be unit-tested and driven from the command line.
 
 pub mod apache;
+pub mod applog;
 pub mod config;
 pub mod downloads;
 pub mod engine;

@@ -113,6 +113,11 @@ pub struct AppView {
     php_releases: Option<Vec<PhpRelease>>,
     /// An action is in flight; controls that would start another are disabled.
     busy: bool,
+    /// How many actions are in flight. `busy` follows this count rather than
+    /// being switched off by whichever action ends first: a quick one (opening
+    /// a terminal) can start and finish while a long one (installing a site)
+    /// is still running.
+    in_flight: usize,
     /// Quit was chosen: the window shows only a waiting message until the
     /// services have stopped and the app exits.
     quitting: bool,
@@ -184,6 +189,7 @@ impl AppView {
             install_progress: None,
             php_releases: None,
             busy: false,
+            in_flight: 0,
             quitting: false,
             logo: Arc::new(Image::from_bytes(
                 ImageFormat::Png,
@@ -201,6 +207,21 @@ impl AppView {
         view
     }
 
+    /// Marks one more action as in flight and clears the last error. Each
+    /// call is paired with one of [`Self::finish`] when that action ends.
+    fn begin(&mut self, cx: &mut Context<Self>) {
+        self.in_flight += 1;
+        self.busy = true;
+        self.error = None;
+        cx.notify();
+    }
+
+    /// Marks one action as ended; the app is idle again once all have.
+    fn finish(&mut self) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        self.busy = self.in_flight > 0;
+    }
+
     /// Runs `action` against the engine off the UI thread, then refreshes.
     fn run(
         &mut self,
@@ -210,9 +231,7 @@ impl AppView {
         if self.quitting {
             return;
         }
-        self.busy = true;
-        self.error = None;
-        cx.notify();
+        self.begin(cx);
         let engine = self.engine.clone();
         cx.spawn(async move |this, cx| {
             let (result, snapshot) = cx
@@ -224,7 +243,7 @@ impl AppView {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                this.busy = false;
+                this.finish();
                 this.snapshot = snapshot;
                 this.error = result.err().map(Into::into);
                 // The site's PHP version or extensions may just have changed,
@@ -568,9 +587,7 @@ impl AppView {
         };
         let progress = Arc::new(Mutex::new(String::from("Preparing…")));
         self.install_progress = Some(progress.clone());
-        self.busy = true;
-        self.error = None;
-        cx.notify();
+        self.begin(cx);
 
         // Repaint while the installer reports its steps.
         cx.spawn(async move |this, cx| {
@@ -612,7 +629,7 @@ impl AppView {
                 })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.busy = false;
+                this.finish();
                 this.install_progress = None;
                 this.snapshot = snapshot;
                 match result {
@@ -888,6 +905,13 @@ impl AppView {
                 }),
         );
 
+        let undo_system = Button::new("setting-undo-system")
+            .label("Undo")
+            .disabled(self.busy || !self.snapshot.has_system_changes)
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.run(cx, |engine| engine.remove_system_changes());
+            }));
+
         let port_field = |label: &'static str, state: &Entity<InputState>, cx: &App| {
             field(label, cx).w(px(150.)).child(Input::new(state))
         };
@@ -952,6 +976,12 @@ impl AppView {
                             ),
                     ),
             )
+            .child(card(cx).child(setting_row(
+                "Undo changes to Windows",
+                "Stops trusting OmniPHP's certificates and removes its site addresses.",
+                undo_system,
+                cx,
+            )))
             .into_any_element()
     }
 
@@ -1588,13 +1618,11 @@ impl AppView {
 
     /// Fetches the list of PHP builds that can be downloaded.
     fn load_php_releases(&mut self, cx: &mut Context<Self>) {
-        self.busy = true;
-        self.error = None;
-        cx.notify();
+        self.begin(cx);
         cx.spawn(async move |this, cx| {
             let listed = cx.background_executor().spawn(async { downloads::available_php() }).await;
             let _ = this.update(cx, |this, cx| {
-                this.busy = false;
+                this.finish();
                 match listed {
                     Ok(releases) => this.php_releases = Some(releases),
                     Err(error) => this.error = Some(format!("{error:#}").into()),
@@ -1609,9 +1637,7 @@ impl AppView {
     fn install_php(&mut self, release: PhpRelease, cx: &mut Context<Self>) {
         let progress = Arc::new(Mutex::new(format!("Downloading PHP {}…", release.version)));
         self.install_progress = Some(progress.clone());
-        self.busy = true;
-        self.error = None;
-        cx.notify();
+        self.begin(cx);
 
         // Repaint while the download reports its steps.
         cx.spawn(async move |this, cx| {
@@ -1645,7 +1671,7 @@ impl AppView {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                this.busy = false;
+                this.finish();
                 this.install_progress = None;
                 this.snapshot = snapshot;
                 this.error = result.err().map(Into::into);

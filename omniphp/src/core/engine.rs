@@ -115,6 +115,9 @@ pub struct Snapshot {
     /// Whether Windows trusts the local certificate authority. `true` when
     /// HTTPS is off, since there is then nothing to trust.
     pub ca_trusted: bool,
+    /// Whether Windows holds anything of this install that could be removed:
+    /// its authority among the trusted roots, or addresses in the hosts file.
+    pub has_system_changes: bool,
     /// Site addresses Windows cannot resolve yet (missing from the hosts file).
     pub unregistered_hosts: Vec<String>,
 }
@@ -185,9 +188,12 @@ impl Engine {
             site_settings,
         };
         engine.rescan_sites();
-        // Best effort here; `apply` reports the error if this cannot work.
-        if engine.https_port().is_some() {
-            engine.authority = Authority::load_or_create(&engine.paths.ssl_dir()).ok();
+        // Best effort here; `apply` reports the error if this cannot work. An
+        // authority made earlier is loaded even with HTTPS switched off, so
+        // that Windows can still be told to stop trusting it.
+        let ssl_dir = engine.paths.ssl_dir();
+        if engine.https_port().is_some() || ssl::authority_exists(&ssl_dir) {
+            engine.authority = Authority::load_or_create(&ssl_dir).ok();
         }
         Ok(engine)
     }
@@ -274,7 +280,8 @@ impl Engine {
     }
 
     /// Writes all configuration for the current sites (issuing any missing
-    /// certificates) and checks that Apache accepts it.
+    /// certificates) once Apache has accepted it. When Apache rejects it, the
+    /// files it is running from are left as they were.
     pub fn apply(&mut self) -> Result<()> {
         let apache = self.apache_runtime()?.clone();
         let https_port = self.https_port();
@@ -302,8 +309,7 @@ impl Engine {
             &self.sites,
             &self.phps,
             &self.paths,
-        )?;
-        apache::validate(&apache, &self.paths)
+        )
     }
 
     // ---- services ----------------------------------------------------------
@@ -512,7 +518,7 @@ impl Engine {
     }
 
     pub fn set_run_at_startup(&mut self, enabled: bool) -> Result<()> {
-        startup::set_enabled(enabled)
+        startup::set_enabled(enabled, &self.paths)
     }
 
     /// Regenerates configuration and, if Apache is running, makes it pick the
@@ -568,14 +574,19 @@ impl Engine {
         }
         self.rescan_sites();
 
-        if let Err(error) = self.validate_site(name) {
+        // With Apache running it has the last word: a setting it rejects is
+        // undone like any other unusable one, before anything is saved.
+        // (`apply` leaves the configuration Apache runs from untouched then.)
+        let running = self.apache.status() != ServiceStatus::Stopped;
+        let usable = self.validate_site(name).and_then(|()| if running { self.apply() } else { Ok(()) });
+        if let Err(error) = usable {
             self.site_settings = before;
             self.rescan_sites();
             return Err(error);
         }
         config::save(&self.paths.sites_file(), &self.site_settings)?;
-        if self.apache.status() != ServiceStatus::Stopped {
-            self.reload_apache()?;
+        if running {
+            self.apache.reload()?;
         }
         Ok(())
     }
@@ -853,12 +864,14 @@ impl Engine {
         names
     }
 
+    /// Whether Windows trusts this install's authority right now, whether or
+    /// not HTTPS is in use.
+    fn authority_trusted(&self) -> bool {
+        self.authority.as_ref().is_some_and(|authority| system::ca_trusted(authority.thumbprint()))
+    }
+
     fn ca_trusted(&self) -> bool {
-        match (&self.authority, self.https_port()) {
-            (Some(authority), Some(_)) => system::ca_trusted(authority.thumbprint()),
-            (None, Some(_)) => false,
-            (_, None) => true,
-        }
+        self.https_port().is_none() || self.authority_trusted()
     }
 
     fn pending_system_changes(&self) -> SystemChanges {
@@ -868,8 +881,25 @@ impl Engine {
                 Some(authority) if !self.ca_trusted() => Some(authority.thumbprint().to_string()),
                 _ => None,
             },
+            untrust_ca: None,
             hosts: (system::registered_hosts(&self.paths) != desired).then_some(desired),
         }
+    }
+
+    /// Undoes [`Self::setup_system`]: Windows stops trusting the certificate
+    /// authority and this install's addresses leave the hosts file. Shows one
+    /// administrator prompt, or none when there is nothing to undo. The
+    /// authority itself is kept, so setting up again restores everything.
+    pub fn remove_system_changes(&mut self) -> Result<()> {
+        let changes = SystemChanges {
+            trust_ca: None,
+            untrust_ca: match &self.authority {
+                Some(authority) if self.authority_trusted() => Some(authority.thumbprint().to_string()),
+                _ => None,
+            },
+            hosts: (!system::registered_hosts(&self.paths).is_empty()).then(Vec::new),
+        };
+        system::run_elevated(&changes, &self.paths)
     }
 
     /// Trusts the certificate authority and registers the site addresses, as
@@ -884,6 +914,7 @@ impl Engine {
 
     pub fn snapshot(&mut self) -> Snapshot {
         let registered = system::registered_hosts(&self.paths);
+        let authority_trusted = self.authority_trusted();
         let services = ServiceId::ALL.into_iter().map(|id| self.service_info(id)).collect();
         // Forget tunnels that have died on their own.
         self.shares.retain(|_, share| share.is_alive());
@@ -896,7 +927,7 @@ impl Engine {
             sites: self.sites.clone(),
             services,
             config: self.config.clone(),
-            run_at_startup: startup::is_enabled(),
+            run_at_startup: startup::is_enabled(&self.paths),
             shares,
             can_share: share::find_cloudflared(&self.paths).is_some(),
             mysql_installed: self.mysql_runtime().is_ok(),
@@ -910,7 +941,8 @@ impl Engine {
                 .filter(|site| ssl::covers(&site.hostname))
                 .map(|site| site.name.clone())
                 .collect(),
-            ca_trusted: self.ca_trusted(),
+            ca_trusted: self.https_port().is_none() || authority_trusted,
+            has_system_changes: authority_trusted || !registered.is_empty(),
             unregistered_hosts: self
                 .desired_hosts()
                 .into_iter()
