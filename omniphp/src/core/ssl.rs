@@ -42,7 +42,7 @@ impl Authority {
     pub fn load_or_create(dir: &Path) -> Result<Self> {
         let cert_file = dir.join("ca.crt");
         let key_file = dir.join("ca.key");
-        if !(cert_file.is_file() && key_file.is_file()) {
+        if !authority_exists(dir) {
             std::fs::create_dir_all(dir)?;
             let (cert_pem, key_pem) = generate_authority()?;
             std::fs::write(&key_file, key_pem)
@@ -117,6 +117,11 @@ impl Authority {
         std::fs::write(&stamp_file, stamp)?;
         Ok(Some(files))
     }
+}
+
+/// Whether an authority has already been created in `dir`.
+pub fn authority_exists(dir: &Path) -> bool {
+    dir.join("ca.crt").is_file() && dir.join("ca.key").is_file()
 }
 
 /// Whether the authority is allowed to sign for `name`.

@@ -22,7 +22,7 @@ impl Paths {
     /// that contains both `bin\` and `www\`.
     pub fn discover() -> Result<Self> {
         if let Some(root) = std::env::var_os("OMNIPHP_ROOT") {
-            return Ok(Self::new(root));
+            return Ok(Self::new(normalized(Path::new(&root))));
         }
         let exe = std::env::current_exe().context("cannot locate the executable")?;
         for dir in exe.ancestors().skip(1) {
@@ -40,6 +40,20 @@ impl Paths {
     pub fn root(&self) -> &Path {
         &self.root
     }
+
+    /// A short, stable name for this install, safe to use in the name of a
+    /// Windows kernel object or registry value (neither takes backslashes).
+    /// Everything that must tell installs apart is named after it.
+    pub fn install_key(&self) -> String {
+        // FNV-1a over the lower-cased path: Windows paths are case-insensitive.
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in self.root.to_string_lossy().to_lowercase().bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        format!("{hash:016x}")
+    }
+
     pub fn bin(&self) -> PathBuf {
         self.root.join("bin")
     }
@@ -75,6 +89,11 @@ impl Paths {
     /// Generated vhosts; rewritten on every apply.
     pub fn apache_sites(&self) -> PathBuf {
         self.apache_etc().join("sites")
+    }
+    /// Where a new configuration is written for Apache to check before it
+    /// replaces the one in use.
+    pub fn apache_staging(&self) -> PathBuf {
+        self.apache_etc().join("staging")
     }
     /// Hand-written `*.conf` files the app includes but never touches.
     pub fn apache_custom(&self) -> PathBuf {
@@ -117,6 +136,15 @@ pub fn slash(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
+/// `root` as an absolute path with backslashes and no trailing separator, so
+/// that `C:/OmniPHP/` and `C:\OmniPHP` are written down the same way (the
+/// hosts file and the generated configuration both quote the root). Links are
+/// not resolved: an install reached through a junction keeps that path.
+fn normalized(root: &Path) -> PathBuf {
+    let absolute = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
+    absolute.components().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,6 +152,22 @@ mod tests {
     #[test]
     fn slash_converts_backslashes() {
         assert_eq!(slash(Path::new(r"D:\OmniPHP\www\shop")), "D:/OmniPHP/www/shop");
+    }
+
+    #[test]
+    fn root_is_written_the_same_way_however_it_was_given() {
+        assert_eq!(normalized(Path::new("C:/OmniPHP/")), Path::new(r"C:\OmniPHP"));
+        assert_eq!(normalized(Path::new(r"C:\OmniPHP\\")), Path::new(r"C:\OmniPHP"));
+        assert_eq!(normalized(Path::new(r"C:\OmniPHP\www\..")), Path::new(r"C:\OmniPHP"));
+        assert_eq!(normalized(Path::new(r"C:\OmniPHP")), Path::new(r"C:\OmniPHP"));
+    }
+
+    #[test]
+    fn install_key_identifies_the_install_folder() {
+        let key = Paths::new(r"C:\OmniPHP").install_key();
+        assert_eq!(key, Paths::new(r"c:\omniphp").install_key(), "paths differing only in case are the same install");
+        assert_ne!(key, Paths::new(r"D:\OmniPHP").install_key());
+        assert!(key.chars().all(|c| c.is_ascii_hexdigit()), "must be usable in a kernel object name");
     }
 
     #[test]

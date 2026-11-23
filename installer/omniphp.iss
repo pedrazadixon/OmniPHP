@@ -88,6 +88,13 @@ Filename: "{app}\OmniPHP.exe"; Description: "Start {#AppName}"; Flags: nowait po
 ; Where mod_fcgid lived before it moved to bin\mod_fcgid.
 Type: filesandordirs; Name: "{app}\etc\apache\modules"
 
+[UninstallRun]
+; Undoes what OmniPHP changed in Windows itself: the trusted certificate
+; authority, the site addresses in the hosts file and the startup entry.
+; Windows asks for administrator permission only if there is something to
+; remove; declining leaves it in place and the uninstall goes on.
+Filename: "{app}\OmniPHP.exe"; Parameters: "cleanup"; RunOnceId: "RemoveWindowsChanges"
+
 [UninstallDelete]
 ; Generated configuration and logs. Sites (www) and databases (data) are kept.
 Type: filesandordirs; Name: "{app}\logs"
