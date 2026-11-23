@@ -77,7 +77,10 @@ pub fn scan_php(bin_php: &Path) -> Vec<PhpRuntime> {
         .filter(|dir| dir.join("php-cgi.exe").is_file())
         .map(|dir| {
             let id = folder_name(&dir);
-            let version = probe_php_version(&dir)
+            // The binary is asked only when the folder does not say: asking
+            // starts one process per PHP version, every time the app opens.
+            let version = exact_version_in(&id)
+                .or_else(|| probe_php_version(&dir))
                 .or_else(|| version_in(&id))
                 .unwrap_or_else(|| id.clone());
             PhpRuntime {
@@ -151,6 +154,13 @@ fn scan_extensions(ext_dir: &Path) -> Vec<String> {
     names
 }
 
+/// The version in a folder name when it is exact, down to the patch release:
+/// `php-8.4.28-nts-Win32-vs17-x64` gives `8.4.28`, as the official downloads
+/// are named. `php-8.4-nts-...-latest` gives nothing.
+fn exact_version_in(name: &str) -> Option<String> {
+    version_in(name).filter(|version| version.split('.').filter(|part| !part.is_empty()).count() >= 3)
+}
+
 /// Folder names such as `php-8.4-nts-...-latest` only carry `8.4`, so ask the
 /// binary. `-n` skips php.ini so a broken ini cannot get in the way.
 fn probe_php_version(dir: &Path) -> Option<String> {
@@ -203,6 +213,15 @@ mod tests {
         assert_eq!(version_in("mailpit"), None);
         assert_eq!(version_in("1.22.3").as_deref(), Some("1.22.3"));
         assert_eq!(version_in("mysql-8.4.3-winx64").as_deref(), Some("8.4.3"));
+    }
+
+    #[test]
+    fn only_an_exact_version_in_the_name_spares_asking_the_binary() {
+        assert_eq!(exact_version_in("php-8.4.28-nts-Win32-vs17-x64").as_deref(), Some("8.4.28"));
+        assert_eq!(exact_version_in("php-7.4.33-Win32-vc15-x64").as_deref(), Some("7.4.33"));
+        assert_eq!(exact_version_in("php-8.4-nts-Win32-vs17-x64-latest"), None);
+        assert_eq!(exact_version_in("php-8.4.-nts"), None);
+        assert_eq!(exact_version_in("my-php"), None);
     }
 
     #[test]

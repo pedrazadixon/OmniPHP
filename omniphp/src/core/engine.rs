@@ -88,6 +88,10 @@ pub struct Engine {
     shares: HashMap<String, Share>,
     /// The local certificate authority, when HTTPS is enabled.
     authority: Option<Authority>,
+    /// What PHP last reported in [`Self::php_directives`], with the PHP
+    /// folder and php.ini text it was asked about. Asking starts a PHP
+    /// process, and the answer only changes when one of those two does.
+    directives: Option<(PathBuf, String, Vec<(String, String)>)>,
 }
 
 /// A copy of everything the UI shows. Cheap to clone and free of handles.
@@ -183,6 +187,7 @@ impl Engine {
             redis: RedisService::default(),
             shares: HashMap::new(),
             authority: None,
+            directives: None,
             paths,
             config,
             site_settings,
@@ -283,6 +288,11 @@ impl Engine {
     /// certificates) once Apache has accepted it. When Apache rejects it, the
     /// files it is running from are left as they were.
     pub fn apply(&mut self) -> Result<()> {
+        self.apply_changes().map(|_| ())
+    }
+
+    /// [`Self::apply`], also saying whether any generated file changed.
+    fn apply_changes(&mut self) -> Result<bool> {
         let apache = self.apache_runtime()?.clone();
         let https_port = self.https_port();
         let default_site = self.default_site();
@@ -396,15 +406,55 @@ impl Engine {
         result
     }
 
-    /// Starts every enabled, installed service. All are attempted; the errors
-    /// of those that failed are reported together.
+    /// Starts every enabled, installed service, all at the same time: each one
+    /// waits for its own program to answer, and they do not depend on each
+    /// other. All are attempted; the errors of those that failed are reported
+    /// together.
     pub fn start_all(&mut self) -> Result<()> {
+        let wanted = |engine: &Self, id| engine.is_enabled(id) && engine.is_installed(id);
         let mut errors = Vec::new();
-        for id in ServiceId::ALL {
-            if self.is_enabled(id) && self.is_installed(id)
-                && let Err(error) = self.start(id)
-            {
+
+        // Apache's configuration takes the whole engine, so it is written
+        // before the services go their separate ways.
+        let apache = match wanted(self, ServiceId::Apache).then(|| self.apply()) {
+            Some(Ok(())) => self.apache_runtime().ok().cloned().map(|runtime| (runtime, self.https_port())),
+            Some(Err(error)) => {
                 errors.push(format!("{error:#}"));
+                None
+            }
+            None => None,
+        };
+        let mysql = wanted(self, ServiceId::Mysql).then(|| self.mysql_runtime().ok().cloned()).flatten();
+        let mailpit = wanted(self, ServiceId::Mailpit).then(|| self.mailpit_runtime().ok().cloned()).flatten();
+        let redis = wanted(self, ServiceId::Redis).then(|| self.redis_runtime().ok().cloned()).flatten();
+
+        let Self {
+            apache: apache_service,
+            mysql: mysql_service,
+            mailpit: mailpit_service,
+            redis: redis_service,
+            config,
+            paths,
+            ..
+        } = self;
+        let (config, paths) = (&*config, &*paths);
+        // In the order of `ServiceId::ALL`; `None` for a service left alone.
+        let results = std::thread::scope(|scope| {
+            let started = [
+                apache.map(|(runtime, https_port)| {
+                    scope.spawn(move || apache_service.start(&runtime, &config.apache, https_port, paths))
+                }),
+                mysql.map(|runtime| scope.spawn(move || mysql_service.start(&runtime, &config.mysql, paths))),
+                mailpit.map(|runtime| scope.spawn(move || mailpit_service.start(&runtime, &config.mailpit, paths))),
+                redis.map(|runtime| scope.spawn(move || redis_service.start(&runtime, &config.redis, paths))),
+            ];
+            started.map(|thread| thread.map(|thread| thread.join()))
+        });
+        for (id, result) in ServiceId::ALL.into_iter().zip(results) {
+            match result {
+                None | Some(Ok(Ok(()))) => {}
+                Some(Ok(Err(error))) => errors.push(format!("{error:#}")),
+                Some(Err(_)) => errors.push(format!("{} could not be started (unexpected error).", id.name())),
             }
         }
         if !errors.is_empty() {
@@ -413,11 +463,26 @@ impl Engine {
         Ok(())
     }
 
+    /// Stops every service, all at the same time: MySQL may take a while to
+    /// flush its data and Apache to wind down, and neither waits for the other.
     pub fn stop_all(&mut self) -> Result<()> {
+        let Self { apache, mysql, mailpit, redis, .. } = self;
+        // In the order of `ServiceId::ALL`.
+        let results = std::thread::scope(|scope| {
+            let stopped = [
+                scope.spawn(move || apache.stop()),
+                scope.spawn(move || mysql.stop()),
+                scope.spawn(move || mailpit.stop()),
+                scope.spawn(move || redis.stop()),
+            ];
+            stopped.map(|thread| thread.join())
+        });
         let mut errors = Vec::new();
-        for id in ServiceId::ALL {
-            if let Err(error) = self.stop(id) {
-                errors.push(format!("{}: {error:#}", id.name()));
+        for (id, result) in ServiceId::ALL.into_iter().zip(results) {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => errors.push(format!("{}: {error:#}", id.name())),
+                Err(_) => errors.push(format!("{}: could not be stopped (unexpected error).", id.name())),
             }
         }
         if !errors.is_empty() {
@@ -610,6 +675,7 @@ impl Engine {
     /// Picks up PHP versions added to `bin\php` since the app started.
     pub fn rescan_runtimes(&mut self) {
         self.phps = runtimes::scan_php(&self.paths.bin().join("php"));
+        self.directives = None;
         self.rescan_sites();
     }
 
@@ -665,8 +731,12 @@ impl Engine {
         }
         tools::ensure_adminer(&self.paths, self.config.mysql.port)?;
         self.start(ServiceId::Mysql)?;
-        // Make sure the running Apache knows the /adminer address.
-        self.reload_apache()?;
+        // The running Apache serves /adminer already, unless its configuration
+        // has changed since (the first PHP installed after it started, say).
+        // Only then is it reloaded: a reload ends every running PHP process.
+        if self.apply_changes()? {
+            self.apache.reload()?;
+        }
         let port = match self.config.apache.http_port {
             80 => String::new(),
             port => format!(":{port}"),
@@ -807,9 +877,18 @@ impl Engine {
             .as_ref()
             .and_then(|id| self.phps.iter().find(|php| &php.id == id))
             .context("No PHP is installed.")?;
-        // Make sure the file PHP is asked about reflects the saved settings.
-        php::write_site_ini(&site, php, self.mail_catcher().as_ref(), &self.paths)?;
-        php::list_directives(php, &self.paths.php_site_dir(name).join("php.ini"))
+        // The file PHP is asked about must reflect the saved settings.
+        let ini = php::render_site_ini(&php::base_ini(php), &site, php, self.mail_catcher().as_ref(), &self.paths);
+        if let Some((dir, text, directives)) = &self.directives
+            && *dir == php.dir
+            && *text == ini
+        {
+            return Ok(directives.clone());
+        }
+        php::save_site_ini(&site, &ini, &self.paths)?;
+        let directives = php::list_directives(php, &self.paths.php_site_dir(name).join("php.ini"))?;
+        self.directives = Some((php.dir.clone(), ini, directives.clone()));
+        Ok(directives)
     }
 
     fn site(&self, name: &str) -> Result<&Site> {

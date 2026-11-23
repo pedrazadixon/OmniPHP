@@ -30,6 +30,7 @@ use crate::core::php::SITE_DIRECTIVES;
 use crate::core::runtimes::PhpRuntime;
 use crate::core::services::{ServiceId, ServiceStatus};
 use crate::core::sites::{PUBLIC_DIRS, Site};
+use crate::core::tools;
 
 pub type SharedEngine = Arc<Mutex<Engine>>;
 
@@ -228,6 +229,17 @@ impl AppView {
         cx: &mut Context<Self>,
         action: impl FnOnce(&mut Engine) -> anyhow::Result<()> + Send + 'static,
     ) {
+        self.run_job(cx, move |engine| action(&mut lock(engine)));
+    }
+
+    /// Like [`Self::run`], for work with a slow part that does not need the
+    /// engine (a download): `job` locks the engine itself, only around the
+    /// steps that use it, so nothing else waits for it meanwhile.
+    fn run_job(
+        &mut self,
+        cx: &mut Context<Self>,
+        job: impl FnOnce(&SharedEngine) -> anyhow::Result<()> + Send + 'static,
+    ) {
         if self.quitting {
             return;
         }
@@ -237,9 +249,8 @@ impl AppView {
             let (result, snapshot) = cx
                 .background_executor()
                 .spawn(async move {
-                    let mut engine = lock(&engine);
-                    let result = action(&mut engine).map_err(|error| format!("{error:#}"));
-                    (result, engine.snapshot())
+                    let result = job(&engine).map_err(|error| format!("{error:#}"));
+                    (result, lock(&engine).snapshot())
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -1473,7 +1484,13 @@ impl AppView {
                             .label("Database")
                             .disabled(self.busy || !self.apache_running() || !self.snapshot.mysql_installed)
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.run(cx, |engine| engine.open_database());
+                                // The first time, Adminer is downloaded; the
+                                // engine is not held while that goes on.
+                                this.run_job(cx, |engine| {
+                                    let paths = lock(engine).paths();
+                                    tools::fetch_adminer(&paths)?;
+                                    lock(engine).open_database()
+                                });
                             })),
                     )
                     .child(

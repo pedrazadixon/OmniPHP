@@ -27,6 +27,15 @@ const MODULES: [&str; 22] = [
     "setenvif", "version",
 ];
 
+/// What mod_fcgid does with php-cgi processes nobody is using. Left alone it
+/// keeps up to three per site for good (`FcgidMinProcessesPerClass` is 3 by
+/// default), which adds up with many sites. Here a site keeps none: an idle
+/// process is ended after half an hour, long enough for the site being
+/// worked on to stay warm. Processes are not ended for their age alone.
+const FCGID_IDLE_PROCESSES: &str = "FcgidMinProcessesPerClass 0\n\
+                                    FcgidIdleTimeout 1800\n\
+                                    FcgidProcessLifeTime 0\n";
+
 /// Modules HTTPS needs on top of [`MODULES`].
 const SSL_MODULES: [&str; 2] = ["ssl", "socache_shmcb"];
 
@@ -108,7 +117,8 @@ pub fn render_httpd_conf(
          FcgidConnectTimeout 16\n\
          FcgidMaxRequestsPerProcess 0\n\
          FcgidMaxProcesses 50\n\
-         FcgidMaxRequestLen 1073741824\n\n\
+         FcgidMaxRequestLen 1073741824\n\
+         {FCGID_IDLE_PROCESSES}\n\
          IncludeOptional \"{sites}/*.conf\"\n\
          IncludeOptional \"{etc}/custom/*.conf\"\n",
     );
@@ -241,6 +251,9 @@ struct Generated {
 /// configuration Apache rejects never reaches the files it is running from.
 /// `certificates` maps site names to their certificate; sites without one are
 /// served over HTTP only.
+///
+/// Returns whether anything on disk changed. When nothing did, an Apache
+/// already running from these files has nothing new to pick up.
 pub fn write_all(
     apache: &ApacheRuntime,
     config: &ApacheConfig,
@@ -251,7 +264,7 @@ pub fn write_all(
     sites: &[Site],
     phps: &[PhpRuntime],
     paths: &Paths,
-) -> Result<()> {
+) -> Result<bool> {
     paths.ensure_dirs()?;
     let find_php = |site: &Site| {
         site.php.as_ref().and_then(|id| phps.iter().find(|php| &php.id == id))
@@ -288,13 +301,13 @@ pub fn write_all(
 /// staged copy includes the staged vhosts and the live one the live vhosts.
 ///
 /// The rejected files stay in the staging folder, where Apache's message
-/// points, so they can be looked at.
+/// points, so they can be looked at. Returns whether a live file changed.
 fn install(
     httpd_conf: impl Fn(&Path) -> String,
     generated: &Generated,
     paths: &Paths,
     check: impl FnOnce(&Path) -> Result<()>,
-) -> Result<()> {
+) -> Result<bool> {
     let staging = paths.apache_staging();
     let staged_sites = staging.join("sites");
     std::fs::create_dir_all(&staged_sites)
@@ -310,27 +323,28 @@ fn install(
     // Accepted. Files are written in place rather than moved from staging
     // (moving fails on Windows while a virus scanner holds them), and only
     // those whose contents changed.
+    let mut changed = false;
     let sites_dir = paths.apache_sites();
     for (file, text) in &generated.vhosts {
-        write_if_changed(&sites_dir.join(file), text)?;
+        changed |= write_if_changed(&sites_dir.join(file), text)?;
     }
-    remove_children(&sites_dir, |path| {
+    changed |= remove_children(&sites_dir, |path| {
         path.extension().is_some_and(|ext| ext == "conf")
             && !generated.vhosts.iter().any(|(file, _)| same_name(path, Path::new(file)))
     })?;
-    write_if_changed(&paths.apache_conf(), &httpd_conf(&sites_dir))?;
+    changed |= write_if_changed(&paths.apache_conf(), &httpd_conf(&sites_dir))?;
 
     for (dir, text) in &generated.inis {
         std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
-        write_if_changed(&dir.join("php.ini"), text)?;
+        changed |= write_if_changed(&dir.join("php.ini"), text)?;
     }
     // Drop php.ini folders of sites that no longer exist.
     if let Some(ini_root) = paths.php_site_dir("x").parent() {
-        remove_children(ini_root, |path| {
+        changed |= remove_children(ini_root, |path| {
             path.is_dir() && !generated.inis.iter().any(|(dir, _)| same_name(path, dir))
         })?;
     }
-    Ok(())
+    Ok(changed)
 }
 
 /// Runs `httpd -t` against `httpd_conf`.
@@ -360,12 +374,13 @@ fn write(path: &Path, text: &str) -> Result<()> {
     std::fs::write(path, text).with_context(|| format!("cannot write {}", path.display()))
 }
 
-/// Writes `text` unless the file already holds exactly that.
-fn write_if_changed(path: &Path, text: &str) -> Result<()> {
+/// Writes `text` unless the file already holds exactly that. Returns whether
+/// it wrote.
+fn write_if_changed(path: &Path, text: &str) -> Result<bool> {
     if std::fs::read(path).is_ok_and(|current| current == text.as_bytes()) {
-        return Ok(());
+        return Ok(false);
     }
-    write(path, text)
+    write(path, text).map(|()| true)
 }
 
 /// Whether two paths end in the same file name. Windows file names are
@@ -378,12 +393,16 @@ fn same_name(a: &Path, b: &Path) -> bool {
     }
 }
 
-fn remove_children(dir: &Path, should_remove: impl Fn(&Path) -> bool) -> Result<()> {
+/// Removes the entries of `dir` that `should_remove` picks. Returns whether
+/// any was removed.
+fn remove_children(dir: &Path, should_remove: impl Fn(&Path) -> bool) -> Result<bool> {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return Ok(());
+        return Ok(false);
     };
+    let mut removed = false;
     for path in entries.flatten().map(|entry| entry.path()) {
         if should_remove(&path) {
+            removed = true;
             let result = if path.is_dir() {
                 std::fs::remove_dir_all(&path)
             } else {
@@ -392,7 +411,7 @@ fn remove_children(dir: &Path, should_remove: impl Fn(&Path) -> bool) -> Result<
             result.with_context(|| format!("cannot remove {}", path.display()))?;
         }
     }
-    Ok(())
+    Ok(removed)
 }
 
 #[cfg(test)]
@@ -491,6 +510,7 @@ mod tests {
         assert!(conf.contains("LoadModule fcgid_module \"D:/OmniPHP/bin/mod_fcgid/mod_fcgid.so\""));
         assert!(conf.contains("IncludeOptional \"D:/OmniPHP/etc/apache/sites/*.conf\""));
         assert!(conf.contains("LogFormat \"%h %l %u %t \\\"%r\\\" %>s %b\" common"));
+        assert!(conf.contains("\nFcgidMinProcessesPerClass 0\nFcgidIdleTimeout 1800\nFcgidProcessLifeTime 0\n"));
     }
 
     fn generated(vhosts: &[(&str, &str)], inis: &[(&str, &str)], paths: &Paths) -> Generated {
@@ -549,8 +569,9 @@ mod tests {
             &[("old", "a"), ("Shop", "b")],
             &paths,
         );
-        install(conf, &first, &paths, |_| Ok(())).unwrap();
+        assert!(install(conf, &first, &paths, |_| Ok(())).unwrap(), "new files count as a change");
         assert_eq!(read(&paths.apache_conf()), conf(&paths.apache_sites()), "live, not staged, vhosts");
+        assert!(!install(conf, &first, &paths, |_| Ok(())).unwrap(), "the same again changes nothing");
 
         // The folder `old` was deleted and `Shop` renamed to `shop`.
         let second = generated(
@@ -558,7 +579,7 @@ mod tests {
             &[("shop", "c")],
             &paths,
         );
-        install(conf, &second, &paths, |_| Ok(())).unwrap();
+        assert!(install(conf, &second, &paths, |_| Ok(())).unwrap());
         assert!(!paths.apache_sites().join("site-old.conf").exists());
         assert!(!paths.php_site_dir("old").exists());
         assert_eq!(std::fs::read_dir(paths.apache_sites()).unwrap().count(), 2);
@@ -576,7 +597,7 @@ mod tests {
         let mut permissions = file.metadata().unwrap().permissions();
         permissions.set_readonly(true);
         std::fs::set_permissions(&file, permissions.clone()).unwrap();
-        assert!(write_if_changed(&file, "same").is_ok());
+        assert!(!write_if_changed(&file, "same").unwrap());
         assert!(write_if_changed(&file, "different").is_err());
         permissions.set_readonly(false);
         std::fs::set_permissions(&file, permissions).unwrap();
