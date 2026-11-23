@@ -175,9 +175,13 @@ pub fn write_site_ini(
     mail: Option<&MailCatcher>,
     paths: &Paths,
 ) -> Result<()> {
+    save_site_ini(site, &render_site_ini(&base_ini(php), site, php, mail, paths), paths)
+}
+
+/// Writes `ini`, the text [`render_site_ini`] gave for `site`, as its php.ini.
+pub fn save_site_ini(site: &Site, ini: &str, paths: &Paths) -> Result<()> {
     let dir = paths.php_site_dir(&site.name);
     std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
-    let ini = render_site_ini(&base_ini(php), site, php, mail, paths);
     let file = dir.join("php.ini");
     std::fs::write(&file, ini).with_context(|| format!("cannot write {}", file.display()))
 }

@@ -88,6 +88,10 @@ pub struct Engine {
     shares: HashMap<String, Share>,
     /// The local certificate authority, when HTTPS is enabled.
     authority: Option<Authority>,
+    /// What PHP last reported in [`Self::php_directives`], with the PHP
+    /// folder and php.ini text it was asked about. Asking starts a PHP
+    /// process, and the answer only changes when one of those two does.
+    directives: Option<(PathBuf, String, Vec<(String, String)>)>,
 }
 
 /// A copy of everything the UI shows. Cheap to clone and free of handles.
@@ -115,6 +119,9 @@ pub struct Snapshot {
     /// Whether Windows trusts the local certificate authority. `true` when
     /// HTTPS is off, since there is then nothing to trust.
     pub ca_trusted: bool,
+    /// Whether Windows holds anything of this install that could be removed:
+    /// its authority among the trusted roots, or addresses in the hosts file.
+    pub has_system_changes: bool,
     /// Site addresses Windows cannot resolve yet (missing from the hosts file).
     pub unregistered_hosts: Vec<String>,
 }
@@ -180,14 +187,18 @@ impl Engine {
             redis: RedisService::default(),
             shares: HashMap::new(),
             authority: None,
+            directives: None,
             paths,
             config,
             site_settings,
         };
         engine.rescan_sites();
-        // Best effort here; `apply` reports the error if this cannot work.
-        if engine.https_port().is_some() {
-            engine.authority = Authority::load_or_create(&engine.paths.ssl_dir()).ok();
+        // Best effort here; `apply` reports the error if this cannot work. An
+        // authority made earlier is loaded even with HTTPS switched off, so
+        // that Windows can still be told to stop trusting it.
+        let ssl_dir = engine.paths.ssl_dir();
+        if engine.https_port().is_some() || ssl::authority_exists(&ssl_dir) {
+            engine.authority = Authority::load_or_create(&ssl_dir).ok();
         }
         Ok(engine)
     }
@@ -274,8 +285,14 @@ impl Engine {
     }
 
     /// Writes all configuration for the current sites (issuing any missing
-    /// certificates) and checks that Apache accepts it.
+    /// certificates) once Apache has accepted it. When Apache rejects it, the
+    /// files it is running from are left as they were.
     pub fn apply(&mut self) -> Result<()> {
+        self.apply_changes().map(|_| ())
+    }
+
+    /// [`Self::apply`], also saying whether any generated file changed.
+    fn apply_changes(&mut self) -> Result<bool> {
         let apache = self.apache_runtime()?.clone();
         let https_port = self.https_port();
         let default_site = self.default_site();
@@ -302,8 +319,7 @@ impl Engine {
             &self.sites,
             &self.phps,
             &self.paths,
-        )?;
-        apache::validate(&apache, &self.paths)
+        )
     }
 
     // ---- services ----------------------------------------------------------
@@ -390,15 +406,55 @@ impl Engine {
         result
     }
 
-    /// Starts every enabled, installed service. All are attempted; the errors
-    /// of those that failed are reported together.
+    /// Starts every enabled, installed service, all at the same time: each one
+    /// waits for its own program to answer, and they do not depend on each
+    /// other. All are attempted; the errors of those that failed are reported
+    /// together.
     pub fn start_all(&mut self) -> Result<()> {
+        let wanted = |engine: &Self, id| engine.is_enabled(id) && engine.is_installed(id);
         let mut errors = Vec::new();
-        for id in ServiceId::ALL {
-            if self.is_enabled(id) && self.is_installed(id)
-                && let Err(error) = self.start(id)
-            {
+
+        // Apache's configuration takes the whole engine, so it is written
+        // before the services go their separate ways.
+        let apache = match wanted(self, ServiceId::Apache).then(|| self.apply()) {
+            Some(Ok(())) => self.apache_runtime().ok().cloned().map(|runtime| (runtime, self.https_port())),
+            Some(Err(error)) => {
                 errors.push(format!("{error:#}"));
+                None
+            }
+            None => None,
+        };
+        let mysql = wanted(self, ServiceId::Mysql).then(|| self.mysql_runtime().ok().cloned()).flatten();
+        let mailpit = wanted(self, ServiceId::Mailpit).then(|| self.mailpit_runtime().ok().cloned()).flatten();
+        let redis = wanted(self, ServiceId::Redis).then(|| self.redis_runtime().ok().cloned()).flatten();
+
+        let Self {
+            apache: apache_service,
+            mysql: mysql_service,
+            mailpit: mailpit_service,
+            redis: redis_service,
+            config,
+            paths,
+            ..
+        } = self;
+        let (config, paths) = (&*config, &*paths);
+        // In the order of `ServiceId::ALL`; `None` for a service left alone.
+        let results = std::thread::scope(|scope| {
+            let started = [
+                apache.map(|(runtime, https_port)| {
+                    scope.spawn(move || apache_service.start(&runtime, &config.apache, https_port, paths))
+                }),
+                mysql.map(|runtime| scope.spawn(move || mysql_service.start(&runtime, &config.mysql, paths))),
+                mailpit.map(|runtime| scope.spawn(move || mailpit_service.start(&runtime, &config.mailpit, paths))),
+                redis.map(|runtime| scope.spawn(move || redis_service.start(&runtime, &config.redis, paths))),
+            ];
+            started.map(|thread| thread.map(|thread| thread.join()))
+        });
+        for (id, result) in ServiceId::ALL.into_iter().zip(results) {
+            match result {
+                None | Some(Ok(Ok(()))) => {}
+                Some(Ok(Err(error))) => errors.push(format!("{error:#}")),
+                Some(Err(_)) => errors.push(format!("{} could not be started (unexpected error).", id.name())),
             }
         }
         if !errors.is_empty() {
@@ -407,11 +463,26 @@ impl Engine {
         Ok(())
     }
 
+    /// Stops every service, all at the same time: MySQL may take a while to
+    /// flush its data and Apache to wind down, and neither waits for the other.
     pub fn stop_all(&mut self) -> Result<()> {
+        let Self { apache, mysql, mailpit, redis, .. } = self;
+        // In the order of `ServiceId::ALL`.
+        let results = std::thread::scope(|scope| {
+            let stopped = [
+                scope.spawn(move || apache.stop()),
+                scope.spawn(move || mysql.stop()),
+                scope.spawn(move || mailpit.stop()),
+                scope.spawn(move || redis.stop()),
+            ];
+            stopped.map(|thread| thread.join())
+        });
         let mut errors = Vec::new();
-        for id in ServiceId::ALL {
-            if let Err(error) = self.stop(id) {
-                errors.push(format!("{}: {error:#}", id.name()));
+        for (id, result) in ServiceId::ALL.into_iter().zip(results) {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => errors.push(format!("{}: {error:#}", id.name())),
+                Err(_) => errors.push(format!("{}: could not be stopped (unexpected error).", id.name())),
             }
         }
         if !errors.is_empty() {
@@ -512,7 +583,7 @@ impl Engine {
     }
 
     pub fn set_run_at_startup(&mut self, enabled: bool) -> Result<()> {
-        startup::set_enabled(enabled)
+        startup::set_enabled(enabled, &self.paths)
     }
 
     /// Regenerates configuration and, if Apache is running, makes it pick the
@@ -568,14 +639,19 @@ impl Engine {
         }
         self.rescan_sites();
 
-        if let Err(error) = self.validate_site(name) {
+        // With Apache running it has the last word: a setting it rejects is
+        // undone like any other unusable one, before anything is saved.
+        // (`apply` leaves the configuration Apache runs from untouched then.)
+        let running = self.apache.status() != ServiceStatus::Stopped;
+        let usable = self.validate_site(name).and_then(|()| if running { self.apply() } else { Ok(()) });
+        if let Err(error) = usable {
             self.site_settings = before;
             self.rescan_sites();
             return Err(error);
         }
         config::save(&self.paths.sites_file(), &self.site_settings)?;
-        if self.apache.status() != ServiceStatus::Stopped {
-            self.reload_apache()?;
+        if running {
+            self.apache.reload()?;
         }
         Ok(())
     }
@@ -599,6 +675,7 @@ impl Engine {
     /// Picks up PHP versions added to `bin\php` since the app started.
     pub fn rescan_runtimes(&mut self) {
         self.phps = runtimes::scan_php(&self.paths.bin().join("php"));
+        self.directives = None;
         self.rescan_sites();
     }
 
@@ -654,8 +731,12 @@ impl Engine {
         }
         tools::ensure_adminer(&self.paths, self.config.mysql.port)?;
         self.start(ServiceId::Mysql)?;
-        // Make sure the running Apache knows the /adminer address.
-        self.reload_apache()?;
+        // The running Apache serves /adminer already, unless its configuration
+        // has changed since (the first PHP installed after it started, say).
+        // Only then is it reloaded: a reload ends every running PHP process.
+        if self.apply_changes()? {
+            self.apache.reload()?;
+        }
         let port = match self.config.apache.http_port {
             80 => String::new(),
             port => format!(":{port}"),
@@ -796,9 +877,18 @@ impl Engine {
             .as_ref()
             .and_then(|id| self.phps.iter().find(|php| &php.id == id))
             .context("No PHP is installed.")?;
-        // Make sure the file PHP is asked about reflects the saved settings.
-        php::write_site_ini(&site, php, self.mail_catcher().as_ref(), &self.paths)?;
-        php::list_directives(php, &self.paths.php_site_dir(name).join("php.ini"))
+        // The file PHP is asked about must reflect the saved settings.
+        let ini = php::render_site_ini(&php::base_ini(php), &site, php, self.mail_catcher().as_ref(), &self.paths);
+        if let Some((dir, text, directives)) = &self.directives
+            && *dir == php.dir
+            && *text == ini
+        {
+            return Ok(directives.clone());
+        }
+        php::save_site_ini(&site, &ini, &self.paths)?;
+        let directives = php::list_directives(php, &self.paths.php_site_dir(name).join("php.ini"))?;
+        self.directives = Some((php.dir.clone(), ini, directives.clone()));
+        Ok(directives)
     }
 
     fn site(&self, name: &str) -> Result<&Site> {
@@ -853,12 +943,14 @@ impl Engine {
         names
     }
 
+    /// Whether Windows trusts this install's authority right now, whether or
+    /// not HTTPS is in use.
+    fn authority_trusted(&self) -> bool {
+        self.authority.as_ref().is_some_and(|authority| system::ca_trusted(authority.thumbprint()))
+    }
+
     fn ca_trusted(&self) -> bool {
-        match (&self.authority, self.https_port()) {
-            (Some(authority), Some(_)) => system::ca_trusted(authority.thumbprint()),
-            (None, Some(_)) => false,
-            (_, None) => true,
-        }
+        self.https_port().is_none() || self.authority_trusted()
     }
 
     fn pending_system_changes(&self) -> SystemChanges {
@@ -868,8 +960,25 @@ impl Engine {
                 Some(authority) if !self.ca_trusted() => Some(authority.thumbprint().to_string()),
                 _ => None,
             },
+            untrust_ca: None,
             hosts: (system::registered_hosts(&self.paths) != desired).then_some(desired),
         }
+    }
+
+    /// Undoes [`Self::setup_system`]: Windows stops trusting the certificate
+    /// authority and this install's addresses leave the hosts file. Shows one
+    /// administrator prompt, or none when there is nothing to undo. The
+    /// authority itself is kept, so setting up again restores everything.
+    pub fn remove_system_changes(&mut self) -> Result<()> {
+        let changes = SystemChanges {
+            trust_ca: None,
+            untrust_ca: match &self.authority {
+                Some(authority) if self.authority_trusted() => Some(authority.thumbprint().to_string()),
+                _ => None,
+            },
+            hosts: (!system::registered_hosts(&self.paths).is_empty()).then(Vec::new),
+        };
+        system::run_elevated(&changes, &self.paths)
     }
 
     /// Trusts the certificate authority and registers the site addresses, as
@@ -884,6 +993,7 @@ impl Engine {
 
     pub fn snapshot(&mut self) -> Snapshot {
         let registered = system::registered_hosts(&self.paths);
+        let authority_trusted = self.authority_trusted();
         let services = ServiceId::ALL.into_iter().map(|id| self.service_info(id)).collect();
         // Forget tunnels that have died on their own.
         self.shares.retain(|_, share| share.is_alive());
@@ -896,7 +1006,7 @@ impl Engine {
             sites: self.sites.clone(),
             services,
             config: self.config.clone(),
-            run_at_startup: startup::is_enabled(),
+            run_at_startup: startup::is_enabled(&self.paths),
             shares,
             can_share: share::find_cloudflared(&self.paths).is_some(),
             mysql_installed: self.mysql_runtime().is_ok(),
@@ -910,7 +1020,8 @@ impl Engine {
                 .filter(|site| ssl::covers(&site.hostname))
                 .map(|site| site.name.clone())
                 .collect(),
-            ca_trusted: self.ca_trusted(),
+            ca_trusted: self.https_port().is_none() || authority_trusted,
+            has_system_changes: authority_trusted || !registered.is_empty(),
             unregistered_hosts: self
                 .desired_hosts()
                 .into_iter()

@@ -2,30 +2,17 @@
 //! same install asks the first to show its window and exits. Different
 //! installs (say `C:\OmniPHP` and a development copy) are independent and
 //! can run side by side.
+//!
+//! An install is identified by its [`Paths::install_key`](crate::core::paths::Paths::install_key).
 
 use std::ffi::c_void;
-use std::path::Path;
 
 use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, WAIT_OBJECT_0};
 use windows_sys::Win32::System::Threading::{
     CreateEventW, CreateMutexW, INFINITE, SetEvent, WaitForSingleObject,
 };
 
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-/// A short, stable name for the install at `root`, safe to use in the name of
-/// a Windows kernel object (which cannot contain backslashes).
-pub fn key_for(root: &Path) -> String {
-    // FNV-1a over the lower-cased path: Windows paths are case-insensitive.
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in root.to_string_lossy().to_lowercase().bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{hash:016x}")
-}
+use crate::core::proc::wide;
 
 fn show_event(key: &str) -> *mut c_void {
     // Auto-reset, initially unsignalled. Returns the existing event when another
@@ -69,17 +56,4 @@ pub fn listen(key: &str, on_show: impl Fn() + Send + 'static) {
             }
         })
         .ok();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn key_identifies_the_install_folder() {
-        let key = key_for(Path::new(r"C:\OmniPHP"));
-        assert_eq!(key, key_for(Path::new(r"c:\omniphp")), "paths differing only in case are the same install");
-        assert_ne!(key, key_for(Path::new(r"D:\OmniPHP")));
-        assert!(key.chars().all(|c| c.is_ascii_hexdigit()), "must be usable in a kernel object name");
-    }
 }

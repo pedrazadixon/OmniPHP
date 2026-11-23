@@ -32,7 +32,7 @@ cargo test merging_is_stable   # a single test by name
 
 `cargo test` does not rebuild the app executable; run `cargo build` before launching `target\debug\omniphp.exe`.
 
-Headless commands on the same exe (useful for testing without the UI): `omniphp apply` (write and validate all config), `omniphp serve` (apply, start services, stop on Enter), `omniphp setup` (trust CA + hosts, UAC prompt), `omniphp new <template> <name> [--no-db]`.
+Headless commands on the same exe (useful for testing without the UI): `omniphp apply` (write and validate all config), `omniphp serve` (apply, start services, stop on Enter), `omniphp setup` (trust CA + hosts, UAC prompt), `omniphp cleanup` (undo setup and the startup entry; the uninstaller runs it), `omniphp new <template> <name> [--no-db]`.
 
 Installer (needs a release build first; bundles `bin\` by default, ~200 MB):
 
@@ -49,17 +49,17 @@ The installed Inno Setup is an older 6.x: use `ArchitecturesAllowed=x64`, not `x
 
 **Engine** (`core\engine.rs`) is the single facade. It owns config, scanned runtimes, sites and running services, and exposes actions (`start`, `apply`, `update_site`, `share_site`, …) plus a `Snapshot` for rendering. The UI holds it as `Arc<Mutex<Engine>>`; `AppView::run` (`ui\app.rs`) executes an action on the background executor and then refreshes the snapshot. A 2 s poller calls `sync_sites` to pick up changes in `www\`.
 
-**Per-site PHP** works through Apache `mod_fcgid` configured inside each generated vhost (`core\apache.rs`): `FcgidWrapper` points at the chosen version's `php-cgi.exe`, and `FcgidInitialEnv PHPRC` points at `etc\php\sites\<site>\`, where `core\php.rs` writes a php.ini made of PHP's `php.ini-development`, a managed block, then the site's own overrides last. The app manages no PHP processes itself. `mod_fcgid.so` lives in `bin\mod_fcgid\` and must match Apache's VS18 build.
+**Per-site PHP** works through Apache `mod_fcgid` configured inside each generated vhost (`core\apache.rs`): `FcgidWrapper` points at the chosen version's `php-cgi.exe`, and `FcgidInitialEnv PHPRC` points at `etc\php\sites\<site>\`, where `core\php.rs` writes a php.ini made of PHP's `php.ini-development`, a managed block, then the site's own overrides last. The app manages no PHP processes itself; mod_fcgid ends a php-cgi that has been idle for half an hour and keeps none in reserve (`FCGID_IDLE_PROCESSES` in `core\apache.rs`). `mod_fcgid.so` lives in `bin\mod_fcgid\` and must match Apache's VS18 build.
 
-**Apply cycle**: any change to sites or settings regenerates everything under `etc\` and validates with `httpd -t` before reloading. Generated files are overwritten; hand-written Apache config goes in `etc\apache\custom\`.
+**Apply cycle**: any change to sites or settings regenerates everything under `etc\`. The new configuration is first written to `etc\apache\staging\` and checked there with `httpd -t`; only when Apache accepts it are the live files replaced (in place, and only those that changed) and Apache reloaded. A rejected configuration stays in `staging\` for inspection and the live one is untouched. Generated files are overwritten; hand-written Apache config goes in `etc\apache\custom\`.
 
 **Sites** (`core\sites.rs`) are the top-level folders of `www\`. Hostname defaults to `{name}.test`; document root is auto-detected (`public`, `public_html`, `webroot`, `web`). Overrides are stored centrally in `sites.toml`, keyed by folder name, never inside the project folder.
 
 **HTTPS** (`core\ssl.rs`): a local name-constrained CA plus one leaf certificate per site, generated with rcgen. The CA is trusted once; new sites need no new trust prompt.
 
-**Elevation** (`core\system.rs`): the app runs unelevated. The only privileged operations are trusting the CA and writing the hosts file; both happen by relaunching the exe as `omniphp elevated …` through UAC, and only when the user clicks "Set up". The Hosts button on the Services page (`core\tools.rs`) opens the hosts file as administrator in `bin\notepad++`, falling back to Windows Notepad; that is the user editing by hand, not the app. The hosts file gets one block per install, tagged with the install root (`core\hosts.rs`), so several installs coexist.
+**Elevation** (`core\system.rs`): the app runs unelevated. The only privileged operations are trusting the CA and writing the hosts file; both happen by relaunching the exe as `omniphp elevated …` through UAC, and only when the user clicks "Set up". The helper is told its install with `--root`, never left to discover it. The same helper undoes both ("Undo changes to Windows" in Settings, `omniphp cleanup`). The Hosts button on the Services page (`core\tools.rs`) opens the hosts file as administrator in `bin\notepad++`, falling back to Windows Notepad; that is the user editing by hand, not the app. The hosts file gets one block per install, tagged with the install root (`core\hosts.rs`), so several installs coexist. Anything else that must tell installs apart (single-instance mutex, startup entry) is named after `Paths::install_key()`.
 
-**Services** (`core\services.rs`, `core\proc.rs`): Apache, MySQL, Mailpit and Redis run as child processes inside a kill-on-close Job Object, with no console window. Graceful stop uses named Windows events (`ap<pid>_shutdown`, `ap<pid>_restart`, `mysqld<pid>_shutdown`). Cloudflare quick tunnels (`core\share.rs`) are separate and deliberately survive Apache restarts.
+**Services** (`core\services.rs`, `core\proc.rs`): Apache, MySQL, Mailpit and Redis run as child processes inside a kill-on-close Job Object, with no console window. Graceful stop uses named Windows events (`ap<pid>_shutdown`, `ap<pid>_restart`, `mysqld<pid>_shutdown`). `start_all` and `stop_all` handle the services in parallel, one thread each. Cloudflare quick tunnels (`core\share.rs`) are separate and deliberately survive Apache restarts.
 
 **Desktop shell**: tray icon via `tray-icon` on GPUI's main thread (`ui\tray.rs`); closing the window hides it (`ui\window.rs`), and the app quits only from the tray. One instance per install root (`single_instance.rs`).
 

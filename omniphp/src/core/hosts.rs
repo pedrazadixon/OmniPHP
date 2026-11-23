@@ -11,6 +11,17 @@ fn begin(root: &Path) -> String {
 fn end(root: &Path) -> String {
     format!("# END OmniPHP [{}]", root.display())
 }
+
+/// Whether `line` is the marker line `marker`. Case is ignored: Windows paths
+/// are case-insensitive, so an install started as `c:\omniphp` must still
+/// recognise the block it wrote as `C:\OmniPHP` instead of adding a second one.
+fn is_marker(line: &str, marker: &str) -> bool {
+    let line = line.trim();
+    // Only the folder varies in case. Testing for the fixed part first keeps
+    // every other line of the file from being lower-cased on each read.
+    line.contains(" OmniPHP [") && line.to_lowercase() == marker.to_lowercase()
+}
+
 pub fn hosts_path() -> PathBuf {
     let windows = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
     PathBuf::from(windows).join("System32").join("drivers").join("etc").join("hosts")
@@ -31,9 +42,9 @@ pub fn managed_names(hosts: &str, root: &Path) -> Vec<String> {
     let (begin, end) = (begin(root), end(root));
     hosts
         .lines()
-        .skip_while(|line| line.trim() != begin)
+        .skip_while(|line| !is_marker(line, &begin))
         .skip(1)
-        .take_while(|line| line.trim() != end)
+        .take_while(|line| !is_marker(line, &end))
         .filter_map(|line| {
             let mut parts = line.split_whitespace();
             (parts.next()? == "127.0.0.1").then(|| parts.next().map(str::to_string))?
@@ -48,10 +59,9 @@ pub fn merge(hosts: &str, root: &Path, names: &[String]) -> String {
     let mut kept: Vec<&str> = Vec::new();
     let mut inside = false;
     for line in hosts.lines() {
-        let trimmed = line.trim();
-        if trimmed == begin {
+        if is_marker(line, &begin) {
             inside = true;
-        } else if trimmed == end {
+        } else if is_marker(line, &end) {
             inside = false;
         } else if !inside {
             kept.push(line);
@@ -125,6 +135,18 @@ mod tests {
         let hosts = merge(&hosts, other, &[]);
         assert_eq!(managed_names(&hosts, root()), ["test1.test"]);
         assert!(managed_names(&hosts, other).is_empty());
+    }
+
+    #[test]
+    fn the_same_install_spelled_in_another_case_keeps_one_block() {
+        let lower = Path::new(r"c:\omniphp");
+        let hosts = merge("1.2.3.4 other\r\n", root(), &names(&["a.test"]));
+        assert_eq!(managed_names(&hosts, lower), ["a.test"], "the block is recognised");
+
+        let hosts = merge(&hosts, lower, &names(&["a.test", "b.test"]));
+        assert_eq!(hosts.matches("# BEGIN OmniPHP").count(), 1, "replaced, not stacked");
+        assert_eq!(managed_names(&hosts, root()), ["a.test", "b.test"]);
+        assert_eq!(merge(&hosts, root(), &[]), "1.2.3.4 other\r\n");
     }
 
     #[test]

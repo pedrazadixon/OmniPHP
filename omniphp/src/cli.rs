@@ -8,9 +8,14 @@
 //!                    symfony or prestashop
 //! omniphp setup    trust the certificate authority and register site
 //!                    addresses with Windows (asks for administrator permission)
+//! omniphp cleanup  undo what OmniPHP changed in Windows: the trusted
+//!                    authority, the site addresses and the startup entry
+//!                    (asks for administrator permission if needed; the
+//!                    uninstaller runs this)
 //! ```
 //!
-//! `omniphp elevated ...` is internal: it is what `setup` runs as administrator.
+//! `omniphp elevated ...` is internal: it is what `setup` and `cleanup` run as
+//! administrator.
 
 use anyhow::{Result, bail};
 
@@ -20,10 +25,20 @@ use crate::core::paths::Paths;
 use crate::core::quickapp::{self, Template};
 use crate::core::system;
 
+/// A release build is a GUI program and starts without a console, so what a
+/// command prints would go nowhere. This borrows the console of the prompt
+/// the command was typed at. It changes nothing when output is redirected to
+/// a file or a pipe, or when there is a console already (debug builds).
+fn attach_parent_console() {
+    use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+    unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+}
+
 pub fn run(args: &[String]) -> i32 {
     if args[0] == "elevated" {
         return system::elevated_main(&args[1..]);
     }
+    attach_parent_console();
     match try_run(&args[0], &args[1..]) {
         Ok(()) => 0,
         Err(error) => {
@@ -34,10 +49,17 @@ pub fn run(args: &[String]) -> i32 {
 }
 
 fn try_run(command: &str, rest: &[String]) -> Result<()> {
-    if !matches!(command, "apply" | "serve" | "setup" | "new") {
-        bail!("unknown command \"{command}\" (expected: apply, serve, setup, new)");
+    if !matches!(command, "apply" | "serve" | "setup" | "cleanup" | "new") {
+        bail!("unknown command \"{command}\" (expected: apply, serve, setup, cleanup, new)");
     }
     let mut engine = Engine::load(Paths::discover()?)?;
+    // Cleaning up must work for an install that cannot run where it is.
+    if command == "cleanup" {
+        engine.set_run_at_startup(false)?;
+        engine.remove_system_changes()?;
+        println!("clean    Windows holds no trusted authority, site addresses or startup entry of this install");
+        return Ok(());
+    }
     engine.check_root()?;
 
     match command {

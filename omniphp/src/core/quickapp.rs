@@ -7,6 +7,7 @@
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
@@ -201,8 +202,25 @@ pub fn after_database(job: &InstallJob) -> Result<()> {
 
 // ---- downloads and archives -------------------------------------------------
 
+/// How long a server may take to accept a connection.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long a server may stay silent once connected. The count restarts with
+/// every piece received, so a large download on a slow line is not cut short.
+const SILENCE_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub(super) fn http_get(url: &str) -> Result<ureq::http::Response<ureq::Body>> {
+    http_get_within(url, CONNECT_TIMEOUT, SILENCE_TIMEOUT)
+}
+
+/// Without these limits a server that stops answering would hang the
+/// download for good, and the window's busy state with it.
+fn http_get_within(url: &str, connect: Duration, silence: Duration) -> Result<ureq::http::Response<ureq::Body>> {
     ureq::get(url)
+        .config()
+        .timeout_resolve(Some(connect))
+        .timeout_connect(Some(connect))
+        .timeout_per_read(Some(silence))
+        .build()
         // GitHub's API refuses requests without a client name.
         .header("User-Agent", "omniphp-local-dev")
         .call()
@@ -516,6 +534,27 @@ mod tests {
         assert_eq!(common_root(flat.iter().map(PathBuf::as_path)), None);
         let mixed = paths(&["app/index.php", "readme.txt"]);
         assert_eq!(common_root(mixed.iter().map(PathBuf::as_path)), None);
+    }
+
+    #[test]
+    fn a_server_that_goes_silent_fails_the_download() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        // Accepts the connection and then says nothing, until the test is over.
+        let (over, wait) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let connection = listener.accept();
+            let _ = wait.recv();
+            drop(connection);
+        });
+
+        let started = std::time::Instant::now();
+        let result = http_get_within(&url, Duration::from_secs(5), Duration::from_millis(300));
+        assert!(result.is_err(), "silence is not an answer");
+        assert!(started.elapsed() < Duration::from_secs(5), "and must not hang the download");
+
+        drop(over);
+        server.join().unwrap();
     }
 
     #[test]

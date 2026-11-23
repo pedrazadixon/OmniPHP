@@ -30,6 +30,7 @@ use crate::core::php::SITE_DIRECTIVES;
 use crate::core::runtimes::PhpRuntime;
 use crate::core::services::{ServiceId, ServiceStatus};
 use crate::core::sites::{PUBLIC_DIRS, Site};
+use crate::core::tools;
 
 pub type SharedEngine = Arc<Mutex<Engine>>;
 
@@ -113,6 +114,11 @@ pub struct AppView {
     php_releases: Option<Vec<PhpRelease>>,
     /// An action is in flight; controls that would start another are disabled.
     busy: bool,
+    /// How many actions are in flight. `busy` follows this count rather than
+    /// being switched off by whichever action ends first: a quick one (opening
+    /// a terminal) can start and finish while a long one (installing a site)
+    /// is still running.
+    in_flight: usize,
     /// Quit was chosen: the window shows only a waiting message until the
     /// services have stopped and the app exits.
     quitting: bool,
@@ -184,6 +190,7 @@ impl AppView {
             install_progress: None,
             php_releases: None,
             busy: false,
+            in_flight: 0,
             quitting: false,
             logo: Arc::new(Image::from_bytes(
                 ImageFormat::Png,
@@ -201,30 +208,53 @@ impl AppView {
         view
     }
 
+    /// Marks one more action as in flight and clears the last error. Each
+    /// call is paired with one of [`Self::finish`] when that action ends.
+    fn begin(&mut self, cx: &mut Context<Self>) {
+        self.in_flight += 1;
+        self.busy = true;
+        self.error = None;
+        cx.notify();
+    }
+
+    /// Marks one action as ended; the app is idle again once all have.
+    fn finish(&mut self) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        self.busy = self.in_flight > 0;
+    }
+
     /// Runs `action` against the engine off the UI thread, then refreshes.
     fn run(
         &mut self,
         cx: &mut Context<Self>,
         action: impl FnOnce(&mut Engine) -> anyhow::Result<()> + Send + 'static,
     ) {
+        self.run_job(cx, move |engine| action(&mut lock(engine)));
+    }
+
+    /// Like [`Self::run`], for work with a slow part that does not need the
+    /// engine (a download): `job` locks the engine itself, only around the
+    /// steps that use it, so nothing else waits for it meanwhile.
+    fn run_job(
+        &mut self,
+        cx: &mut Context<Self>,
+        job: impl FnOnce(&SharedEngine) -> anyhow::Result<()> + Send + 'static,
+    ) {
         if self.quitting {
             return;
         }
-        self.busy = true;
-        self.error = None;
-        cx.notify();
+        self.begin(cx);
         let engine = self.engine.clone();
         cx.spawn(async move |this, cx| {
             let (result, snapshot) = cx
                 .background_executor()
                 .spawn(async move {
-                    let mut engine = lock(&engine);
-                    let result = action(&mut engine).map_err(|error| format!("{error:#}"));
-                    (result, engine.snapshot())
+                    let result = job(&engine).map_err(|error| format!("{error:#}"));
+                    (result, lock(&engine).snapshot())
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                this.busy = false;
+                this.finish();
                 this.snapshot = snapshot;
                 this.error = result.err().map(Into::into);
                 // The site's PHP version or extensions may just have changed,
@@ -568,9 +598,7 @@ impl AppView {
         };
         let progress = Arc::new(Mutex::new(String::from("Preparing…")));
         self.install_progress = Some(progress.clone());
-        self.busy = true;
-        self.error = None;
-        cx.notify();
+        self.begin(cx);
 
         // Repaint while the installer reports its steps.
         cx.spawn(async move |this, cx| {
@@ -612,7 +640,7 @@ impl AppView {
                 })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.busy = false;
+                this.finish();
                 this.install_progress = None;
                 this.snapshot = snapshot;
                 match result {
@@ -888,6 +916,13 @@ impl AppView {
                 }),
         );
 
+        let undo_system = Button::new("setting-undo-system")
+            .label("Undo")
+            .disabled(self.busy || !self.snapshot.has_system_changes)
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.run(cx, |engine| engine.remove_system_changes());
+            }));
+
         let port_field = |label: &'static str, state: &Entity<InputState>, cx: &App| {
             field(label, cx).w(px(150.)).child(Input::new(state))
         };
@@ -952,6 +987,12 @@ impl AppView {
                             ),
                     ),
             )
+            .child(card(cx).child(setting_row(
+                "Undo changes to Windows",
+                "Stops trusting OmniPHP's certificates and removes its site addresses.",
+                undo_system,
+                cx,
+            )))
             .into_any_element()
     }
 
@@ -1443,7 +1484,13 @@ impl AppView {
                             .label("Database")
                             .disabled(self.busy || !self.apache_running() || !self.snapshot.mysql_installed)
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.run(cx, |engine| engine.open_database());
+                                // The first time, Adminer is downloaded; the
+                                // engine is not held while that goes on.
+                                this.run_job(cx, |engine| {
+                                    let paths = lock(engine).paths();
+                                    tools::fetch_adminer(&paths)?;
+                                    lock(engine).open_database()
+                                });
                             })),
                     )
                     .child(
@@ -1588,13 +1635,11 @@ impl AppView {
 
     /// Fetches the list of PHP builds that can be downloaded.
     fn load_php_releases(&mut self, cx: &mut Context<Self>) {
-        self.busy = true;
-        self.error = None;
-        cx.notify();
+        self.begin(cx);
         cx.spawn(async move |this, cx| {
             let listed = cx.background_executor().spawn(async { downloads::available_php() }).await;
             let _ = this.update(cx, |this, cx| {
-                this.busy = false;
+                this.finish();
                 match listed {
                     Ok(releases) => this.php_releases = Some(releases),
                     Err(error) => this.error = Some(format!("{error:#}").into()),
@@ -1609,9 +1654,7 @@ impl AppView {
     fn install_php(&mut self, release: PhpRelease, cx: &mut Context<Self>) {
         let progress = Arc::new(Mutex::new(format!("Downloading PHP {}…", release.version)));
         self.install_progress = Some(progress.clone());
-        self.busy = true;
-        self.error = None;
-        cx.notify();
+        self.begin(cx);
 
         // Repaint while the download reports its steps.
         cx.spawn(async move |this, cx| {
@@ -1645,7 +1688,7 @@ impl AppView {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                this.busy = false;
+                this.finish();
                 this.install_progress = None;
                 this.snapshot = snapshot;
                 this.error = result.err().map(Into::into);

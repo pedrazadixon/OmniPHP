@@ -173,13 +173,21 @@ fn download_adminer(script: &Path) -> Result<()> {
     Err(failure.unwrap_or_else(|| anyhow::anyhow!("runtimes.json gives no address for adminer")))
 }
 
-/// Makes sure Adminer is in place (downloading it if `bin\adminer` is empty)
-/// and writes the wrapper page Apache serves.
-pub fn ensure_adminer(paths: &Paths, mysql_port: u16) -> Result<()> {
+/// Downloads Adminer if `bin\adminer` does not hold it yet. Apart from
+/// [`ensure_adminer`] so that the window can do it without holding the engine.
+pub fn fetch_adminer(paths: &Paths) -> Result<()> {
     let script = adminer_script(paths);
     if !script.is_file() {
         download_adminer(&script)?;
     }
+    Ok(())
+}
+
+/// Makes sure Adminer is in place (downloading it if `bin\adminer` is empty)
+/// and writes the wrapper page Apache serves.
+pub fn ensure_adminer(paths: &Paths, mysql_port: u16) -> Result<()> {
+    fetch_adminer(paths)?;
+    let script = adminer_script(paths);
     let dir = adminer_dir(paths);
     std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
     // Adminer used to be downloaded next to the wrapper; that copy is unused now.

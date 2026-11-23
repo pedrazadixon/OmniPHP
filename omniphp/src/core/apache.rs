@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
@@ -27,6 +27,15 @@ const MODULES: [&str; 22] = [
     "setenvif", "version",
 ];
 
+/// What mod_fcgid does with php-cgi processes nobody is using. Left alone it
+/// keeps up to three per site for good (`FcgidMinProcessesPerClass` is 3 by
+/// default), which adds up with many sites. Here a site keeps none: an idle
+/// process is ended after half an hour, long enough for the site being
+/// worked on to stay warm. Processes are not ended for their age alone.
+const FCGID_IDLE_PROCESSES: &str = "FcgidMinProcessesPerClass 0\n\
+                                    FcgidIdleTimeout 1800\n\
+                                    FcgidProcessLifeTime 0\n";
+
 /// Modules HTTPS needs on top of [`MODULES`].
 const SSL_MODULES: [&str; 2] = ["ssl", "socache_shmcb"];
 
@@ -37,16 +46,20 @@ pub fn ssl_available(apache: &ApacheRuntime) -> bool {
         .all(|module| apache.dir.join("modules").join(format!("mod_{module}.so")).is_file())
 }
 
-/// `https_port` is `Some` when HTTPS is enabled and available.
+/// `https_port` is `Some` when HTTPS is enabled and available. `sites_dir` is
+/// the folder whose vhosts are included: the live one, or the staging copy
+/// while a new configuration is being checked.
 pub fn render_httpd_conf(
     apache: &ApacheRuntime,
     config: &ApacheConfig,
     https_port: Option<u16>,
+    sites_dir: &Path,
     paths: &Paths,
 ) -> String {
     let mut conf = String::new();
     let logs = slash(&paths.logs());
     let etc = slash(&paths.apache_etc());
+    let sites = slash(sites_dir);
     let tmp = slash(&paths.tmp());
     let _ = write!(
         conf,
@@ -104,8 +117,9 @@ pub fn render_httpd_conf(
          FcgidConnectTimeout 16\n\
          FcgidMaxRequestsPerProcess 0\n\
          FcgidMaxProcesses 50\n\
-         FcgidMaxRequestLen 1073741824\n\n\
-         IncludeOptional \"{etc}/sites/*.conf\"\n\
+         FcgidMaxRequestLen 1073741824\n\
+         {FCGID_IDLE_PROCESSES}\n\
+         IncludeOptional \"{sites}/*.conf\"\n\
          IncludeOptional \"{etc}/custom/*.conf\"\n",
     );
     conf
@@ -222,9 +236,24 @@ fn render_vhost_body(site: &Site, php: Option<&PhpRuntime>, paths: &Paths) -> St
     conf
 }
 
-/// Writes `httpd.conf`, every vhost and every site's php.ini, replacing what a
-/// previous run generated. `certificates` maps site names to their
-/// certificate; sites without one are served over HTTP only.
+/// Everything one apply generates besides `httpd.conf`, held in memory until
+/// Apache has accepted it.
+#[derive(Debug, Default)]
+struct Generated {
+    /// File name and contents of each vhost file.
+    vhosts: Vec<(String, String)>,
+    /// The folder and contents of each site's php.ini.
+    inis: Vec<(PathBuf, String)>,
+}
+
+/// Generates `httpd.conf`, every vhost and every site's php.ini, has Apache
+/// check them, and only then replaces what a previous run generated: a
+/// configuration Apache rejects never reaches the files it is running from.
+/// `certificates` maps site names to their certificate; sites without one are
+/// served over HTTP only.
+///
+/// Returns whether anything on disk changed. When nothing did, an Apache
+/// already running from these files has nothing new to pick up.
 pub fn write_all(
     apache: &ApacheRuntime,
     config: &ApacheConfig,
@@ -235,39 +264,91 @@ pub fn write_all(
     sites: &[Site],
     phps: &[PhpRuntime],
     paths: &Paths,
-) -> Result<()> {
+) -> Result<bool> {
     paths.ensure_dirs()?;
     let find_php = |site: &Site| {
         site.php.as_ref().and_then(|id| phps.iter().find(|php| &php.id == id))
     };
 
-    write(&paths.apache_conf(), &render_httpd_conf(apache, config, https_port, paths))?;
-
-    let sites_dir = paths.apache_sites();
-    remove_children(&sites_dir, |path| path.extension().is_some_and(|ext| ext == "conf"))?;
     // "00-" sorts first, and Apache treats the first vhost as the fallback.
     let all = std::iter::once((String::from("00-default.conf"), default_site))
         .chain(sites.iter().map(|site| (format!("site-{}.conf", site.name), site)));
-    let mut live_ini_dirs = Vec::new();
+    let mut generated = Generated::default();
+    // The stock php.ini of a PHP build is read once, not once per site.
+    let mut stock_inis: HashMap<&str, String> = HashMap::new();
     for (file, site) in all {
         let php = find_php(site);
         let tls = https_port.zip(certificates.get(&site.name));
-        write(&sites_dir.join(file), &render_vhost(site, php, config.http_port, tls, paths))?;
+        generated.vhosts.push((file, render_vhost(site, php, config.http_port, tls, paths)));
         if let Some(php) = php {
-            super::php::write_site_ini(site, php, mail, paths)?;
-            live_ini_dirs.push(paths.php_site_dir(&site.name));
+            let stock = stock_inis.entry(php.id.as_str()).or_insert_with(|| super::php::base_ini(php));
+            let ini = super::php::render_site_ini(stock, site, php, mail, paths);
+            generated.inis.push((paths.php_site_dir(&site.name), ini));
         }
     }
 
-    // Drop php.ini folders of sites that no longer exist.
-    if let Some(ini_root) = paths.php_site_dir("x").parent() {
-        remove_children(ini_root, |path| path.is_dir() && !live_ini_dirs.contains(&path.to_path_buf()))?;
-    }
-    Ok(())
+    install(
+        |sites_dir| render_httpd_conf(apache, config, https_port, sites_dir, paths),
+        &generated,
+        paths,
+        |httpd_conf| validate(apache, httpd_conf, paths),
+    )
 }
 
-/// Runs `httpd -t` against the generated configuration.
-pub fn validate(apache: &ApacheRuntime, paths: &Paths) -> Result<()> {
+/// Writes the configuration to the staging folder, lets `check` judge the
+/// staged `httpd.conf`, and replaces the live files only if it passes.
+/// `httpd_conf` renders the main file for a given vhost folder, since the
+/// staged copy includes the staged vhosts and the live one the live vhosts.
+///
+/// The rejected files stay in the staging folder, where Apache's message
+/// points, so they can be looked at. Returns whether a live file changed.
+fn install(
+    httpd_conf: impl Fn(&Path) -> String,
+    generated: &Generated,
+    paths: &Paths,
+    check: impl FnOnce(&Path) -> Result<()>,
+) -> Result<bool> {
+    let staging = paths.apache_staging();
+    let staged_sites = staging.join("sites");
+    std::fs::create_dir_all(&staged_sites)
+        .with_context(|| format!("cannot create {}", staged_sites.display()))?;
+    remove_children(&staged_sites, |_| true)?;
+    for (file, text) in &generated.vhosts {
+        write(&staged_sites.join(file), text)?;
+    }
+    let staged_conf = staging.join("httpd.conf");
+    write(&staged_conf, &httpd_conf(&staged_sites))?;
+    check(&staged_conf)?;
+
+    // Accepted. Files are written in place rather than moved from staging
+    // (moving fails on Windows while a virus scanner holds them), and only
+    // those whose contents changed.
+    let mut changed = false;
+    let sites_dir = paths.apache_sites();
+    for (file, text) in &generated.vhosts {
+        changed |= write_if_changed(&sites_dir.join(file), text)?;
+    }
+    changed |= remove_children(&sites_dir, |path| {
+        path.extension().is_some_and(|ext| ext == "conf")
+            && !generated.vhosts.iter().any(|(file, _)| same_name(path, Path::new(file)))
+    })?;
+    changed |= write_if_changed(&paths.apache_conf(), &httpd_conf(&sites_dir))?;
+
+    for (dir, text) in &generated.inis {
+        std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+        changed |= write_if_changed(&dir.join("php.ini"), text)?;
+    }
+    // Drop php.ini folders of sites that no longer exist.
+    if let Some(ini_root) = paths.php_site_dir("x").parent() {
+        changed |= remove_children(ini_root, |path| {
+            path.is_dir() && !generated.inis.iter().any(|(dir, _)| same_name(path, dir))
+        })?;
+    }
+    Ok(changed)
+}
+
+/// Runs `httpd -t` against `httpd_conf`.
+pub fn validate(apache: &ApacheRuntime, httpd_conf: &Path, paths: &Paths) -> Result<()> {
     if !paths.fcgid_module().is_file() {
         bail!(
             "mod_fcgid is missing: expected {} (it must match the Apache build; fetch-runtimes.bat downloads it)",
@@ -277,7 +358,7 @@ pub fn validate(apache: &ApacheRuntime, paths: &Paths) -> Result<()> {
     let output = quiet_command(apache.httpd())
         .arg("-t")
         .arg("-f")
-        .arg(paths.apache_conf())
+        .arg(httpd_conf)
         .output()
         .with_context(|| format!("cannot run {}", apache.httpd().display()))?;
     if !output.status.success() {
@@ -293,12 +374,35 @@ fn write(path: &Path, text: &str) -> Result<()> {
     std::fs::write(path, text).with_context(|| format!("cannot write {}", path.display()))
 }
 
-fn remove_children(dir: &Path, should_remove: impl Fn(&Path) -> bool) -> Result<()> {
+/// Writes `text` unless the file already holds exactly that. Returns whether
+/// it wrote.
+fn write_if_changed(path: &Path, text: &str) -> Result<bool> {
+    if std::fs::read(path).is_ok_and(|current| current == text.as_bytes()) {
+        return Ok(false);
+    }
+    write(path, text).map(|()| true)
+}
+
+/// Whether two paths end in the same file name. Windows file names are
+/// case-insensitive: a site folder renamed from `Shop` to `shop` still owns
+/// the files generated under the old spelling.
+fn same_name(a: &Path, b: &Path) -> bool {
+    match (a.file_name(), b.file_name()) {
+        (Some(a), Some(b)) => a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase(),
+        _ => false,
+    }
+}
+
+/// Removes the entries of `dir` that `should_remove` picks. Returns whether
+/// any was removed.
+fn remove_children(dir: &Path, should_remove: impl Fn(&Path) -> bool) -> Result<bool> {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return Ok(());
+        return Ok(false);
     };
+    let mut removed = false;
     for path in entries.flatten().map(|entry| entry.path()) {
         if should_remove(&path) {
+            removed = true;
             let result = if path.is_dir() {
                 std::fs::remove_dir_all(&path)
             } else {
@@ -307,7 +411,7 @@ fn remove_children(dir: &Path, should_remove: impl Fn(&Path) -> bool) -> Result<
             result.with_context(|| format!("cannot remove {}", path.display()))?;
         }
     }
-    Ok(())
+    Ok(removed)
 }
 
 #[cfg(test)]
@@ -388,16 +492,114 @@ mod tests {
             dir: PathBuf::from(r"D:\OmniPHP\bin\apache\httpd-2.4.71"),
         };
         let config = ApacheConfig { http_port: 8080, ..Default::default() };
-        let with_ssl = render_httpd_conf(&apache, &config, Some(8443), &paths());
+        let live = paths().apache_sites();
+        let with_ssl = render_httpd_conf(&apache, &config, Some(8443), &live, &paths());
         assert!(with_ssl.contains("Listen 127.0.0.1:8443 https"));
         assert!(with_ssl.contains("SSLSessionCache \"shmcb:D:/OmniPHP/tmp/ssl_scache(512000)\""));
 
-        let conf = render_httpd_conf(&apache, &config, None, &paths());
+        // The copy Apache checks includes the staged vhosts and nothing live.
+        let staged_sites = paths().apache_staging().join("sites");
+        let staged = render_httpd_conf(&apache, &config, None, &staged_sites, &paths());
+        assert!(staged.contains("IncludeOptional \"D:/OmniPHP/etc/apache/staging/sites/*.conf\""));
+        assert!(!staged.contains("IncludeOptional \"D:/OmniPHP/etc/apache/sites/*.conf\""));
+
+        let conf = render_httpd_conf(&apache, &config, None, &live, &paths());
         assert!(!conf.contains("SSL"));
         assert!(conf.contains("Listen 127.0.0.1:8080"));
         assert!(conf.contains("ServerRoot \"${SRVROOT}\""));
         assert!(conf.contains("LoadModule fcgid_module \"D:/OmniPHP/bin/mod_fcgid/mod_fcgid.so\""));
         assert!(conf.contains("IncludeOptional \"D:/OmniPHP/etc/apache/sites/*.conf\""));
         assert!(conf.contains("LogFormat \"%h %l %u %t \\\"%r\\\" %>s %b\" common"));
+        assert!(conf.contains("\nFcgidMinProcessesPerClass 0\nFcgidIdleTimeout 1800\nFcgidProcessLifeTime 0\n"));
+    }
+
+    fn generated(vhosts: &[(&str, &str)], inis: &[(&str, &str)], paths: &Paths) -> Generated {
+        Generated {
+            vhosts: vhosts.iter().map(|(file, text)| (file.to_string(), text.to_string())).collect(),
+            inis: inis.iter().map(|(site, text)| (paths.php_site_dir(site), text.to_string())).collect(),
+        }
+    }
+
+    fn read(file: &Path) -> String {
+        std::fs::read_to_string(file).unwrap_or_else(|error| panic!("{}: {error}", file.display()))
+    }
+
+    /// Stands in for `httpd.conf`: all that matters is which vhosts it includes.
+    fn conf(sites: &Path) -> String {
+        format!("Include {}", slash(sites))
+    }
+
+    #[test]
+    fn rejected_configuration_never_reaches_the_live_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path());
+        paths.ensure_dirs().unwrap();
+        let good = generated(&[("site-shop.conf", "good")], &[("shop", "memory_limit = 1G")], &paths);
+        install(conf, &good, &paths, |_| Ok(())).unwrap();
+
+        let bad = generated(
+            &[("site-shop.conf", "bad"), ("site-new.conf", "bad")],
+            &[("shop", "memory_limit = 2G")],
+            &paths,
+        );
+        let error = install(conf, &bad, &paths, |staged_conf| {
+            // What Apache is asked about is the new configuration...
+            let staged_sites = staged_conf.parent().unwrap().join("sites");
+            assert_eq!(read(staged_conf), conf(&staged_sites));
+            assert_eq!(read(&staged_sites.join("site-shop.conf")), "bad");
+            bail!("Syntax error")
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "Syntax error");
+
+        // ...while the one in use is untouched.
+        assert_eq!(read(&paths.apache_sites().join("site-shop.conf")), "good");
+        assert!(!paths.apache_sites().join("site-new.conf").exists());
+        assert_eq!(read(&paths.apache_conf()), conf(&paths.apache_sites()));
+        assert_eq!(read(&paths.php_site_dir("shop").join("php.ini")), "memory_limit = 1G");
+    }
+
+    #[test]
+    fn accepted_configuration_replaces_the_live_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path());
+        paths.ensure_dirs().unwrap();
+        let first = generated(
+            &[("00-default.conf", "default"), ("site-old.conf", "old"), ("site-Shop.conf", "shop")],
+            &[("old", "a"), ("Shop", "b")],
+            &paths,
+        );
+        assert!(install(conf, &first, &paths, |_| Ok(())).unwrap(), "new files count as a change");
+        assert_eq!(read(&paths.apache_conf()), conf(&paths.apache_sites()), "live, not staged, vhosts");
+        assert!(!install(conf, &first, &paths, |_| Ok(())).unwrap(), "the same again changes nothing");
+
+        // The folder `old` was deleted and `Shop` renamed to `shop`.
+        let second = generated(
+            &[("00-default.conf", "default"), ("site-shop.conf", "shop v2")],
+            &[("shop", "c")],
+            &paths,
+        );
+        assert!(install(conf, &second, &paths, |_| Ok(())).unwrap());
+        assert!(!paths.apache_sites().join("site-old.conf").exists());
+        assert!(!paths.php_site_dir("old").exists());
+        assert_eq!(std::fs::read_dir(paths.apache_sites()).unwrap().count(), 2);
+        // A rename that only changes case must not lose the files it just wrote.
+        assert_eq!(read(&paths.apache_sites().join("site-shop.conf")), "shop v2");
+        assert_eq!(read(&paths.php_site_dir("shop").join("php.ini")), "c");
+    }
+
+    #[test]
+    fn unchanged_files_are_not_written_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("site-shop.conf");
+        write_if_changed(&file, "same").unwrap();
+        // A read-only file cannot be written, so succeeding proves it was not.
+        let mut permissions = file.metadata().unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&file, permissions.clone()).unwrap();
+        assert!(!write_if_changed(&file, "same").unwrap());
+        assert!(write_if_changed(&file, "different").is_err());
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&file, permissions).unwrap();
     }
 }
